@@ -38,7 +38,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #   NACP building is skipped as well.
 #---------------------------------------------------------------------------------
 TARGET		:=	$(notdir $(CURDIR))
-APP_TITLE	:=	Max Payne
+APP_TITLE	:=	RVGL
 BUILD		:=	build
 SOURCES		:=	source source/hooks
 DATA		:=	data
@@ -60,7 +60,7 @@ CXXFLAGS	:= $(CFLAGS)
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lopenal -lSDL2 -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lnx -lm
+LIBS	:= -lopenal -lmpg123 -lSDL2_image -lpng16 -ljpeg -lwebp -lz -lSDL2 -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lnx -lm
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing

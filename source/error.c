@@ -16,16 +16,20 @@
 #include "error.h"
 
 void fatal_error(const char *fmt, ...) {
+  char buf[512];
+  va_list list;
+  va_start(list, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, list);
+  va_end(list);
+
+  debugPrintf("FATAL ERROR: %s\n", buf);
+
   PadState pad;
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
   padInitializeDefault(&pad);
 
   consoleInit(NULL);
-
-  va_list list;
-  va_start(list, fmt);
-  vprintf(fmt, list);
-  va_end(list);
+  printf("%s", buf);
 
   printf("\n\nPress A to exit.");
 

@@ -95,11 +95,7 @@ int NVEventEGLInit(void) {
 }
 
 void patch_opengl(void) {
-  // patch egl stuff
-  hook_arm64(so_find_addr("_Z14NVEventEGLInitv"), (uintptr_t)NVEventEGLInit);
-  hook_arm64(so_find_addr("_Z21NVEventEGLMakeCurrentv"), (uintptr_t)NVEventEGLMakeCurrent);
-  hook_arm64(so_find_addr("_Z23NVEventEGLUnmakeCurrentv"), (uintptr_t)NVEventEGLUnmakeCurrent);
-  hook_arm64(so_find_addr("_Z21NVEventEGLSwapBuffersv"), (uintptr_t)NVEventEGLSwapBuffers);
+  // OpenGL is loaded dynamically via GLAD using SDL_GL_GetProcAddress
 }
 
 void deinit_opengl(void) {

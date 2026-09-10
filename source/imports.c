@@ -1,10 +1,12 @@
-/* imports.c -- .so import resolution
+/* imports.c -- .so import resolution for RVGL on Nintendo Switch
  *
  * Copyright (C) 2021 fgsfds, Andy Nguyen
  *
  * This software may be modified and distributed under the terms
  * of the MIT license.  See the LICENSE file for details.
  */
+
+#define _GNU_SOURCE
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -23,30 +25,41 @@
 #include <semaphore.h>
 #include <setjmp.h>
 #include <time.h>
+#include <poll.h>
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/reent.h>
-#include <EGL/egl.h>
-#include <GLES2/gl2.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <locale.h>
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h>
+#define AL_ALEXT_PROTOTYPES
+#include <AL/al.h>
+#include <AL/alc.h>
+#include <AL/alext.h>
+#include <mpg123.h>
+
 #include <switch.h>
 
 #include "config.h"
 #include "so_util.h"
 #include "util.h"
+#include "libc_shim.h"
+#include "imports.h"
 
 extern uintptr_t __cxa_atexit;
-
 extern uintptr_t __stack_chk_fail;
 
 static char *__ctype_ = (char *)&_ctype_;
 
-// this is supposed to be an array of FILEs, which have a different size in libMaxPayne
-// instead use it to determine whether it's trying to print to stdout/stderr
-static uint8_t fake_sF[3][0x100]; // stdout, stderr, stdin
-
 static uint64_t __stack_chk_guard_fake = 0x4242424242424242;
 
-FILE *stderr_fake = (FILE *)0x1337;
+FILE *stderr_fake = (FILE *)&fake_sF[2];
 
 void __assert2(const char *file, int line, const char *func, const char *expr) {
   debugPrintf("assertion failed:\n%s:%d (%s): %s\n", file, line, func, expr);
@@ -54,52 +67,163 @@ void __assert2(const char *file, int line, const char *func, const char *expr) {
 }
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
-#ifdef DEBUG_LOG
   va_list list;
-  static char string[0x1000];
-
+  char string[1024];
   va_start(list, fmt);
   vsnprintf(string, sizeof(string), fmt, list);
   va_end(list);
-
   debugPrintf("%s: %s\n", tag, string);
-#endif
   return 0;
 }
 
-int fake_fprintf(FILE *stream, const char *fmt, ...) {
-  int ret = 0;
-#ifdef DEBUG_LOG
-  va_list list;
-  static char string[0x1000];
-
-  va_start(list, fmt);
-  ret = vsnprintf(string, sizeof(string), fmt, list);
-  va_end(list);
-
-  debugPrintf("%s", string);
-#endif
-  return ret;
+int __isnanf_fake(float x) {
+  return isnan(x);
 }
 
-// pthread stuff
-// have to wrap it since struct sizes are different
+// Android SDL stubs
+static const char *SDL_AndroidGetExternalStoragePath_fake(void) {
+  return "/switch/rvgl";
+}
 
+static int SDL_AndroidRequestPermission_fake(const char *permission) {
+  (void)permission;
+  return 1;
+}
+
+static SDL_Window *SDL_CreateWindow_hook(const char *title, int x, int y, int w, int h, Uint32 flags) {
+  debugPrintf("SDL_CreateWindow: title='%s', %dx%d, flags=0x%08x\n", title, w, h, flags);
+  flags |= SDL_WINDOW_OPENGL;
+  SDL_Window *win = SDL_CreateWindow(title, x, y, w, h, flags);
+  debugPrintf("SDL_CreateWindow -> %p (error: %s)\n", win, SDL_GetError());
+  return win;
+}
+
+static SDL_GLContext SDL_GL_CreateContext_hook(SDL_Window *window) {
+  debugPrintf("SDL_GL_CreateContext for window %p\n", window);
+  SDL_GLContext ctx = SDL_GL_CreateContext(window);
+  debugPrintf("SDL_GL_CreateContext -> %p (error: %s)\n", ctx, SDL_GetError());
+  return ctx;
+}
+
+static char *SDL_GetBasePath_hook(void) {
+  struct stat st;
+  if (stat("/switch/rvgl/assets/models/go2.m", &st) == 0 || stat("assets/models/go2.m", &st) == 0) {
+    return SDL_strdup("/switch/rvgl/assets/");
+  }
+  return SDL_strdup("/switch/rvgl/");
+}
+
+static char *SDL_GetPrefPath_hook(const char *org, const char *app) {
+  (void)org; (void)app;
+  return SDL_strdup("/switch/rvgl/");
+}
+
+// OpenAL hooks
+static ALCcontext *al_ctx = NULL;
+static ALCdevice *al_dev = NULL;
+
+static ALCcontext *alcCreateContextHook(ALCdevice *dev, const ALCint *attrList) {
+  debugPrintf("alcCreateContextHook(dev=%p, attrList=%p)\n", dev, attrList);
+  al_ctx = alcCreateContext(dev, attrList);
+  if (!al_ctx) {
+    debugPrintf("alcCreateContext with attrList failed, trying NULL\n");
+    al_ctx = alcCreateContext(dev, NULL);
+  }
+  debugPrintf("alcCreateContext -> %p\n", al_ctx);
+  if (al_ctx) {
+    alcMakeContextCurrent(al_ctx);
+    alcSetThreadContext(al_ctx);
+  }
+  return al_ctx;
+}
+
+static ALCdevice *alcOpenDeviceHook(const char *name) {
+  al_dev = alcOpenDevice(name);
+  debugPrintf("alcOpenDevice(%s) -> %p\n", name ? name : "(default)", al_dev);
+  return al_dev;
+}
+
+static void *alcGetProcAddress_hook(ALCdevice *dev, const ALCchar *funcname) {
+  void *res = alcGetProcAddress(dev, funcname);
+  if (!res && funcname) {
+    if (strcmp(funcname, "alcSetThreadContext") == 0) return (void *)&alcSetThreadContext;
+    if (strcmp(funcname, "alcGetThreadContext") == 0) return (void *)&alcGetThreadContext;
+  }
+  return res;
+}
+
+static void alSourcePlay_hook(ALuint source) {
+  debugPrintf("alSourcePlay(source=%u)\n", source);
+  alSourcePlay(source);
+}
+
+static void alSourcef_hook(ALuint source, ALenum param, ALfloat value) {
+  if (param == AL_GAIN) {
+    debugPrintf("alSourcef(source=%u, AL_GAIN, %f)\n", source, value);
+  }
+  alSourcef(source, param, value);
+}
+
+static void alBufferData_hook(ALuint buffer, ALenum format, const ALvoid *data, ALsizei size, ALsizei freq) {
+  alBufferData(buffer, format, data, size, freq);
+  ALenum err = alGetError();
+  if (err != AL_NO_ERROR) {
+    debugPrintf("alBufferData(buf=%u, fmt=0x%x, size=%d, freq=%d) ERROR 0x%x\n", buffer, format, size, freq, err);
+  }
+}
+
+static void alSourceQueueBuffers_hook(ALuint source, ALsizei nb, const ALuint *buffers) {
+  alSourceQueueBuffers(source, nb, buffers);
+  ALenum err = alGetError();
+  if (err != AL_NO_ERROR) {
+    debugPrintf("alSourceQueueBuffers(source=%u, nb=%d, buf0=%u) ERROR 0x%x\n", source, nb, nb > 0 && buffers ? buffers[0] : 0, err);
+  } else {
+    static int qcount = 0;
+    if ((++qcount % 20) == 1) {
+      debugPrintf("alSourceQueueBuffers(source=%u, nb=%d, buf0=%u) OK (count=%d)\n", source, nb, nb > 0 && buffers ? buffers[0] : 0, qcount);
+    }
+  }
+}
+
+static void alSourceUnqueueBuffers_hook(ALuint source, ALsizei nb, ALuint *buffers) {
+  alSourceUnqueueBuffers(source, nb, buffers);
+  ALenum err = alGetError();
+  if (err != AL_NO_ERROR) {
+    debugPrintf("alSourceUnqueueBuffers(source=%u, nb=%d) ERROR 0x%x\n", source, nb, err);
+  }
+}
+
+static int dl_iterate_phdr_fake(int (*callback)(void *info, size_t size, void *data), void *data) {
+  return so_dl_iterate_phdr(callback, data);
+}
+
+struct bionic_iovec {
+  void *iov_base;
+  size_t iov_len;
+};
+
+static ssize_t writev_fake(int fd, const struct bionic_iovec *iov, int iovcnt) {
+  ssize_t total = 0;
+  for (int i = 0; i < iovcnt; i++) {
+    ssize_t r = write(fd, iov[i].iov_base, iov[i].iov_len);
+    if (r < 0) return r;
+    total += r;
+  }
+  return total;
+}
+
+// pthread wrappers for Bionic struct compatibility
 int pthread_mutex_init_fake(pthread_mutex_t **uid, const int *mutexattr) {
   pthread_mutex_t *m = calloc(1, sizeof(pthread_mutex_t));
   if (!m) return -1;
-
   const int recursive = (mutexattr && *mutexattr == 1);
   *m = recursive ? PTHREAD_RECURSIVE_MUTEX_INITIALIZER : PTHREAD_MUTEX_INITIALIZER;
-
   int ret = pthread_mutex_init(m, NULL);
   if (ret < 0) {
     free(m);
     return -1;
   }
-
   *uid = m;
-
   return 0;
 }
 
@@ -117,7 +241,7 @@ int pthread_mutex_lock_fake(pthread_mutex_t **uid) {
   if (!*uid) {
     ret = pthread_mutex_init_fake(uid, NULL);
   } else if ((uintptr_t)*uid == 0x4000) {
-    int attr = 1; // recursive
+    int attr = 1;
     ret = pthread_mutex_init_fake(uid, &attr);
   }
   if (ret < 0) return ret;
@@ -129,7 +253,7 @@ int pthread_mutex_unlock_fake(pthread_mutex_t **uid) {
   if (!*uid) {
     ret = pthread_mutex_init_fake(uid, NULL);
   } else if ((uintptr_t)*uid == 0x4000) {
-    int attr = 1; // recursive
+    int attr = 1;
     ret = pthread_mutex_init_fake(uid, &attr);
   }
   if (ret < 0) return ret;
@@ -139,33 +263,25 @@ int pthread_mutex_unlock_fake(pthread_mutex_t **uid) {
 int pthread_cond_init_fake(pthread_cond_t **cnd, const int *condattr) {
   pthread_cond_t *c = calloc(1, sizeof(pthread_cond_t));
   if (!c) return -1;
-
   *c = PTHREAD_COND_INITIALIZER;
-
   int ret = pthread_cond_init(c, NULL);
   if (ret < 0) {
     free(c);
     return -1;
   }
-
   *cnd = c;
-
   return 0;
 }
 
 int pthread_cond_broadcast_fake(pthread_cond_t **cnd) {
-  if (!*cnd) {
-    if (pthread_cond_init_fake(cnd, NULL) < 0)
-      return -1;
-  }
+  if (!*cnd && pthread_cond_init_fake(cnd, NULL) < 0)
+    return -1;
   return pthread_cond_broadcast(*cnd);
 }
 
 int pthread_cond_signal_fake(pthread_cond_t **cnd) {
-  if (!*cnd) {
-    if (pthread_cond_init_fake(cnd, NULL) < 0)
-      return -1;
-  };
+  if (!*cnd && pthread_cond_init_fake(cnd, NULL) < 0)
+    return -1;
   return pthread_cond_signal(*cnd);
 }
 
@@ -179,340 +295,579 @@ int pthread_cond_destroy_fake(pthread_cond_t **cnd) {
 }
 
 int pthread_cond_wait_fake(pthread_cond_t **cnd, pthread_mutex_t **mtx) {
-  if (!*cnd) {
-    if (pthread_cond_init_fake(cnd, NULL) < 0)
-      return -1;
-  }
+  if (!*cnd && pthread_cond_init_fake(cnd, NULL) < 0)
+    return -1;
   return pthread_cond_wait(*cnd, *mtx);
 }
 
 int pthread_cond_timedwait_fake(pthread_cond_t **cnd, pthread_mutex_t **mtx, const struct timespec *t) {
-  if (!*cnd) {
-    if (pthread_cond_init_fake(cnd, NULL) < 0)
-      return -1;
-  }
+  if (!*cnd && pthread_cond_init_fake(cnd, NULL) < 0)
+    return -1;
   return pthread_cond_timedwait(*cnd, *mtx, t);
 }
 
-int pthread_once_fake(volatile int *once_control, void (*init_routine) (void)) {
-  if (!once_control || !init_routine)
-    return -1;
+int pthread_once_fake(volatile int *once_control, void (*init_routine)(void)) {
+  if (!once_control || !init_routine) return -1;
   if (__sync_lock_test_and_set(once_control, 1) == 0)
     (*init_routine)();
   return 0;
 }
 
-// pthread_t is an unsigned int, so it should be fine
-// TODO: probably shouldn't assume default attributes
+static FILE *freopen_hook(const char *path, const char *mode, FILE *stream) {
+  debugPrintf("freopen(path='%s', mode='%s', stream=%p [stdout=%p, stderr=%p])\n",
+              path ? path : "(null)", mode ? mode : "(null)", stream, stdout, stderr);
+  if (stream == stdout || stream == stderr) {
+    FILE *f = fopen(path, mode);
+    return f ? f : stream;
+  }
+  return freopen(path, mode, stream);
+}
+
+static PadState s_switchPad;
+static bool s_switchPadInited = false;
+static uint64_t s_prevKeys = 0;
+
+typedef struct {
+  uint64_t mask;
+  SDL_Scancode scancode;
+  SDL_Keycode keycode;
+} SwitchKeyMap;
+
+static const SwitchKeyMap s_keymap[] = {
+  { HidNpadButton_AnyUp,                             SDL_SCANCODE_UP,     SDLK_UP },
+  { HidNpadButton_AnyDown,                           SDL_SCANCODE_DOWN,   SDLK_DOWN },
+  { HidNpadButton_AnyLeft,                           SDL_SCANCODE_LEFT,   SDLK_LEFT },
+  { HidNpadButton_AnyRight,                          SDL_SCANCODE_RIGHT,  SDLK_RIGHT },
+  { HidNpadButton_A,                                 SDL_SCANCODE_RETURN, SDLK_RETURN },
+  { HidNpadButton_B,                                 SDL_SCANCODE_ESCAPE, SDLK_ESCAPE },
+  { HidNpadButton_X,                                 SDL_SCANCODE_SPACE,  SDLK_SPACE },
+  { HidNpadButton_Y,                                 SDL_SCANCODE_R,      SDLK_r },
+  { HidNpadButton_Plus,                              SDL_SCANCODE_ESCAPE, SDLK_ESCAPE },
+  { HidNpadButton_Minus,                             SDL_SCANCODE_TAB,    SDLK_TAB },
+  { HidNpadButton_ZL | HidNpadButton_L,              SDL_SCANCODE_DOWN,   SDLK_DOWN },
+  { HidNpadButton_ZR | HidNpadButton_R,              SDL_SCANCODE_UP,     SDLK_UP },
+};
+#define NUM_KEYMAPS (sizeof(s_keymap) / sizeof(s_keymap[0]))
+
+#define MAX_SYNTH_EVENTS 32
+static SDL_Event s_synthQueue[MAX_SYNTH_EVENTS];
+static int s_synthHead = 0;
+static int s_synthTail = 0;
+
+static void queue_key_event(Uint32 type, SDL_Scancode scancode, SDL_Keycode sym) {
+  int next = (s_synthTail + 1) % MAX_SYNTH_EVENTS;
+  if (next == s_synthHead) return;
+  SDL_Event *ev = &s_synthQueue[s_synthTail];
+  memset(ev, 0, sizeof(*ev));
+  ev->type = type;
+  ev->key.type = type;
+  ev->key.state = (type == SDL_KEYDOWN) ? SDL_PRESSED : SDL_RELEASED;
+  ev->key.repeat = 0;
+  ev->key.keysym.scancode = scancode;
+  ev->key.keysym.sym = sym;
+  s_synthTail = next;
+}
+
+static uint64_t get_switch_pad_buttons(void) {
+  if (!s_switchPadInited) {
+    padInitializeAny(&s_switchPad);
+    s_switchPadInited = true;
+  }
+  padUpdate(&s_switchPad);
+  uint64_t curKeys = padGetButtons(&s_switchPad);
+  HidAnalogStickState l_stick = padGetStickPos(&s_switchPad, 0);
+  if (l_stick.x < -16000) curKeys |= HidNpadButton_StickLLeft;
+  if (l_stick.x > 16000)  curKeys |= HidNpadButton_StickLRight;
+  if (l_stick.y < -16000) curKeys |= HidNpadButton_StickLDown;
+  if (l_stick.y > 16000)  curKeys |= HidNpadButton_StickLUp;
+  return curKeys;
+}
+
+static Uint8 s_customKeyState[SDL_NUM_SCANCODES];
+
+static const Uint8 *SDL_GetKeyboardState_hook(int *numkeys) {
+  if (numkeys) *numkeys = SDL_NUM_SCANCODES;
+
+  const Uint8 *real = SDL_GetKeyboardState(NULL);
+  if (real) {
+    memcpy(s_customKeyState, real, SDL_NUM_SCANCODES);
+  } else {
+    memset(s_customKeyState, 0, SDL_NUM_SCANCODES);
+  }
+
+  uint64_t curKeys = get_switch_pad_buttons();
+
+  for (size_t i = 0; i < NUM_KEYMAPS; i++) {
+    if (curKeys & s_keymap[i].mask) {
+      s_customKeyState[s_keymap[i].scancode] = 1;
+    }
+  }
+
+  return s_customKeyState;
+}
+
+static int SDL_PollEvent_hook(SDL_Event *event) {
+  uint64_t curKeys = get_switch_pad_buttons();
+
+  for (size_t i = 0; i < NUM_KEYMAPS; i++) {
+    bool wasDown = (s_prevKeys & s_keymap[i].mask) != 0;
+    bool isDown  = (curKeys   & s_keymap[i].mask) != 0;
+    if (isDown && !wasDown) {
+      queue_key_event(SDL_KEYDOWN, s_keymap[i].scancode, s_keymap[i].keycode);
+    } else if (!isDown && wasDown) {
+      queue_key_event(SDL_KEYUP, s_keymap[i].scancode, s_keymap[i].keycode);
+    }
+  }
+  s_prevKeys = curKeys;
+
+  if (s_synthHead != s_synthTail) {
+    if (event) *event = s_synthQueue[s_synthHead];
+    s_synthHead = (s_synthHead + 1) % MAX_SYNTH_EVENTS;
+    return 1;
+  }
+
+  return SDL_PollEvent(event);
+}
+
+static int SDL_NumJoysticks_hook(void) {
+  int count = SDL_NumJoysticks();
+  debugPrintf("SDL_NumJoysticks() -> %d\n", count);
+  return count;
+}
+
+static SDL_Joystick *SDL_JoystickOpen_hook(int device_index) {
+  SDL_Joystick *joy = SDL_JoystickOpen(device_index);
+  debugPrintf("SDL_JoystickOpen(%d) -> %p (%s)\n", device_index, joy, SDL_JoystickNameForIndex(device_index));
+  return joy;
+}
+
+static SDL_GameController *SDL_GameControllerOpen_hook(int joystick_index) {
+  SDL_GameController *pad = SDL_GameControllerOpen(joystick_index);
+  debugPrintf("SDL_GameControllerOpen(%d) -> %p (%s)\n", joystick_index, pad, SDL_GameControllerNameForIndex(joystick_index));
+  return pad;
+}
+
+typedef struct {
+  void *(*entry)(void *);
+  void *arg;
+} ThreadWrapperArgs;
+
+static void *thread_wrapper_func(void *param) {
+  ThreadWrapperArgs *t = (ThreadWrapperArgs *)param;
+  void *(*entry)(void *) = t->entry;
+  void *arg = t->arg;
+  free(t);
+
+  debugPrintf("[Thread %p] started execution\n", (void *)pthread_self());
+  if (al_ctx) {
+    alcMakeContextCurrent(al_ctx);
+    alcSetThreadContext(al_ctx);
+  }
+  void *ret = entry(arg);
+  debugPrintf("[Thread %p] returned cleanly with %p\n", (void *)pthread_self(), ret);
+  return ret;
+}
+
 int pthread_create_fake(pthread_t *thread, const void *unused, void *entry, void *arg) {
-  return pthread_create(thread, NULL, entry, arg);
+  pthread_attr_t a;
+  pthread_attr_init(&a);
+  pthread_attr_setstacksize(&a, 2 * 1024 * 1024);
+  debugPrintf("pthread_create: starting thread %p with 2MB stack\n", entry);
+  ThreadWrapperArgs *targs = malloc(sizeof(*targs));
+  targs->entry = (void *(*)(void *))entry;
+  targs->arg = arg;
+  int res = pthread_create(thread, &a, thread_wrapper_func, targs);
+  debugPrintf("pthread_create -> %d (thread %p)\n", res, thread ? (void *)*thread : NULL);
+  return res;
 }
 
-// GL stuff
+typedef struct {
+  int (*fn)(void *);
+  void *data;
+} SDLThreadWrapperArgs;
 
-void glGetShaderInfoLogHook(GLuint shader, GLsizei maxLength, GLsizei *length, GLchar *infoLog) {
-  glGetShaderInfoLog(shader, maxLength, length, infoLog);
-  debugPrintf("shader info log:\n%s\n", infoLog);
+static int sdl_thread_wrapper(void *param) {
+  SDLThreadWrapperArgs *t = (SDLThreadWrapperArgs *)param;
+  int (*fn)(void *) = t->fn;
+  void *data = t->data;
+  free(t);
+
+  debugPrintf("[SDL Thread %p] started execution\n", (void *)pthread_self());
+  if (al_ctx) {
+    alcMakeContextCurrent(al_ctx);
+    alcSetThreadContext(al_ctx);
+  }
+  int ret = fn(data);
+  debugPrintf("[SDL Thread %p] returned cleanly with %d\n", (void *)pthread_self(), ret);
+  return ret;
 }
 
-void glCompressedTexImage2DHook(GLenum target, GLint level, GLenum format, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void *data) {
-  // don't upload mips
-  if (level == 0)
-    glCompressedTexImage2D(target, level, format, width, height, border, imageSize, data);
+static SDL_Thread *SDL_CreateThread_hook(SDL_ThreadFunction fn, const char *name, void *data) {
+  debugPrintf("SDL_CreateThread('%s', fn=%p, data=%p)\n", name ? name : "unnamed", fn, data);
+  SDLThreadWrapperArgs *t = malloc(sizeof(*t));
+  t->fn = fn;
+  t->data = data;
+  return SDL_CreateThreadWithStackSize(sdl_thread_wrapper, name, 2 * 1024 * 1024, t);
 }
 
-void glTexParameteriHook(GLenum target, GLenum param, GLint val) {
-  // force trilinear filtering instead of bilinear+nearest mipmap
-  if (val == GL_LINEAR_MIPMAP_NEAREST)
-    val = GL_LINEAR_MIPMAP_LINEAR;
-  glTexParameteri(target, param, val);
+static uint32_t s_swapCount = 0;
+static void SDL_GL_SwapWindow_hook(SDL_Window *window) {
+  s_swapCount++;
+  if ((s_swapCount % 300) == 0) {
+    debugPrintf("[Heartbeat] SDL_GL_SwapWindow frame %u\n", s_swapCount);
+  }
+  SDL_GL_SwapWindow(window);
 }
 
-// import table
-
+// DynLib imports table
 DynLibFunction dynlib_functions[] = {
-  { "__sF", (uintptr_t)&fake_sF },
+  { "IMG_Init", (uintptr_t)&IMG_Init },
+  { "IMG_Load_RW", (uintptr_t)&IMG_Load_RW },
+  { "IMG_Quit", (uintptr_t)&IMG_Quit },
+  { "IMG_SavePNG_RW", (uintptr_t)&IMG_SavePNG_RW },
+  { "SDL_AndroidGetExternalStoragePath", (uintptr_t)&SDL_AndroidGetExternalStoragePath_fake },
+  { "SDL_AndroidRequestPermission", (uintptr_t)&SDL_AndroidRequestPermission_fake },
+  { "SDL_ConvertSurfaceFormat", (uintptr_t)&SDL_ConvertSurfaceFormat },
+  { "SDL_CreateMutex", (uintptr_t)&SDL_CreateMutex },
+  { "SDL_CreateRGBSurface", (uintptr_t)&SDL_CreateRGBSurface },
+  { "SDL_CreateSemaphore", (uintptr_t)&SDL_CreateSemaphore },
+  { "SDL_CreateSystemCursor", (uintptr_t)&SDL_CreateSystemCursor },
+  { "SDL_CreateThread", (uintptr_t)&SDL_CreateThread_hook },
+  { "SDL_CreateWindow", (uintptr_t)&SDL_CreateWindow_hook },
+  { "SDL_Delay", (uintptr_t)&SDL_Delay },
+  { "SDL_DestroyMutex", (uintptr_t)&SDL_DestroyMutex },
+  { "SDL_DestroySemaphore", (uintptr_t)&SDL_DestroySemaphore },
+  { "SDL_DestroyWindow", (uintptr_t)&SDL_DestroyWindow },
+  { "SDL_DetachThread", (uintptr_t)&SDL_DetachThread },
+  { "SDL_FreeSurface", (uintptr_t)&SDL_FreeSurface },
+  { "SDL_GL_CreateContext", (uintptr_t)&SDL_GL_CreateContext_hook },
+  { "SDL_GL_DeleteContext", (uintptr_t)&SDL_GL_DeleteContext },
+  { "SDL_GL_GetAttribute", (uintptr_t)&SDL_GL_GetAttribute },
+  { "SDL_GL_GetDrawableSize", (uintptr_t)&SDL_GL_GetDrawableSize },
+  { "SDL_GL_GetProcAddress", (uintptr_t)&SDL_GL_GetProcAddress },
+  { "SDL_GL_MakeCurrent", (uintptr_t)&SDL_GL_MakeCurrent },
+  { "SDL_GL_ResetAttributes", (uintptr_t)&SDL_GL_ResetAttributes },
+  { "SDL_GL_SetAttribute", (uintptr_t)&SDL_GL_SetAttribute },
+  { "SDL_GL_SetSwapInterval", (uintptr_t)&SDL_GL_SetSwapInterval },
+  { "SDL_GL_SwapWindow", (uintptr_t)&SDL_GL_SwapWindow_hook },
+  { "SDL_GameControllerAddMappingsFromRW", (uintptr_t)&SDL_GameControllerAddMappingsFromRW },
+  { "SDL_GameControllerClose", (uintptr_t)&SDL_GameControllerClose },
+  { "SDL_GameControllerGetAxis", (uintptr_t)&SDL_GameControllerGetAxis },
+  { "SDL_GameControllerGetButton", (uintptr_t)&SDL_GameControllerGetButton },
+  { "SDL_GameControllerGetJoystick", (uintptr_t)&SDL_GameControllerGetJoystick },
+  { "SDL_GameControllerMappingForGUID", (uintptr_t)&SDL_GameControllerMappingForGUID },
+  { "SDL_GameControllerNameForIndex", (uintptr_t)&SDL_GameControllerNameForIndex },
+  { "SDL_GameControllerOpen", (uintptr_t)&SDL_GameControllerOpen_hook },
+  { "SDL_GetBasePath", (uintptr_t)&SDL_GetBasePath_hook },
+  { "SDL_GetClipboardText", (uintptr_t)&SDL_GetClipboardText },
+  { "SDL_GetDesktopDisplayMode", (uintptr_t)&SDL_GetDesktopDisplayMode },
+  { "SDL_GetDisplayMode", (uintptr_t)&SDL_GetDisplayMode },
+  { "SDL_GetError", (uintptr_t)&SDL_GetError },
+  { "SDL_GetKeyFromScancode", (uintptr_t)&SDL_GetKeyFromScancode },
+  { "SDL_GetKeyboardState", (uintptr_t)&SDL_GetKeyboardState_hook },
+  { "SDL_GetModState", (uintptr_t)&SDL_GetModState },
+  { "SDL_GetNumDisplayModes", (uintptr_t)&SDL_GetNumDisplayModes },
+  { "SDL_GetPerformanceCounter", (uintptr_t)&SDL_GetPerformanceCounter },
+  { "SDL_GetPerformanceFrequency", (uintptr_t)&SDL_GetPerformanceFrequency },
+  { "SDL_GetPlatform", (uintptr_t)&SDL_GetPlatform },
+  { "SDL_GetPrefPath", (uintptr_t)&SDL_GetPrefPath_hook },
+  { "SDL_GetScancodeName", (uintptr_t)&SDL_GetScancodeName },
+  { "SDL_GetVersion", (uintptr_t)&SDL_GetVersion },
+  { "SDL_GetWindowSize", (uintptr_t)&SDL_GetWindowSize },
+  { "SDL_HapticClose", (uintptr_t)&SDL_HapticClose },
+  { "SDL_HapticDestroyEffect", (uintptr_t)&SDL_HapticDestroyEffect },
+  { "SDL_HapticIndex", (uintptr_t)&SDL_HapticIndex },
+  { "SDL_HapticName", (uintptr_t)&SDL_HapticName },
+  { "SDL_HapticNewEffect", (uintptr_t)&SDL_HapticNewEffect },
+  { "SDL_HapticNumAxes", (uintptr_t)&SDL_HapticNumAxes },
+  { "SDL_HapticNumEffects", (uintptr_t)&SDL_HapticNumEffects },
+  { "SDL_HapticOpenFromJoystick", (uintptr_t)&SDL_HapticOpenFromJoystick },
+  { "SDL_HapticQuery", (uintptr_t)&SDL_HapticQuery },
+  { "SDL_HapticRunEffect", (uintptr_t)&SDL_HapticRunEffect },
+  { "SDL_HapticSetAutocenter", (uintptr_t)&SDL_HapticSetAutocenter },
+  { "SDL_HapticSetGain", (uintptr_t)&SDL_HapticSetGain },
+  { "SDL_HapticUpdateEffect", (uintptr_t)&SDL_HapticUpdateEffect },
+  { "SDL_HasClipboardText", (uintptr_t)&SDL_HasClipboardText },
+  { "SDL_Init", (uintptr_t)&SDL_Init },
+  { "SDL_InitSubSystem", (uintptr_t)&SDL_InitSubSystem },
+  { "SDL_IsGameController", (uintptr_t)&SDL_IsGameController },
+  { "SDL_IsTextInputActive", (uintptr_t)&SDL_IsTextInputActive },
+  { "SDL_JoystickClose", (uintptr_t)&SDL_JoystickClose },
+  { "SDL_JoystickGetAxis", (uintptr_t)&SDL_JoystickGetAxis },
+  { "SDL_JoystickGetButton", (uintptr_t)&SDL_JoystickGetButton },
+  { "SDL_JoystickGetDeviceGUID", (uintptr_t)&SDL_JoystickGetDeviceGUID },
+  { "SDL_JoystickGetGUIDString", (uintptr_t)&SDL_JoystickGetGUIDString },
+  { "SDL_JoystickIsHaptic", (uintptr_t)&SDL_JoystickIsHaptic },
+  { "SDL_JoystickNameForIndex", (uintptr_t)&SDL_JoystickNameForIndex },
+  { "SDL_JoystickNumAxes", (uintptr_t)&SDL_JoystickNumAxes },
+  { "SDL_JoystickNumButtons", (uintptr_t)&SDL_JoystickNumButtons },
+  { "SDL_JoystickNumHats", (uintptr_t)&SDL_JoystickNumHats },
+  { "SDL_JoystickOpen", (uintptr_t)&SDL_JoystickOpen_hook },
+  { "SDL_LockMutex", (uintptr_t)&SDL_LockMutex },
+  { "SDL_NumJoysticks", (uintptr_t)&SDL_NumJoysticks_hook },
+  { "SDL_PollEvent", (uintptr_t)&SDL_PollEvent_hook },
+  { "SDL_Quit", (uintptr_t)&SDL_Quit },
+  { "SDL_RWFromFile", (uintptr_t)&SDL_RWFromFile },
+  { "SDL_RWclose", (uintptr_t)&SDL_RWclose },
+  { "SDL_RWread", (uintptr_t)&SDL_RWread },
+  { "SDL_SemPost", (uintptr_t)&SDL_SemPost },
+  { "SDL_SemWait", (uintptr_t)&SDL_SemWait },
+  { "SDL_SetClipboardText", (uintptr_t)&SDL_SetClipboardText },
+  { "SDL_SetCursor", (uintptr_t)&SDL_SetCursor },
+  { "SDL_SetHint", (uintptr_t)&SDL_SetHint },
+  { "SDL_SetRelativeMouseMode", (uintptr_t)&SDL_SetRelativeMouseMode },
+  { "SDL_SetWindowBrightness", (uintptr_t)&SDL_SetWindowBrightness },
+  { "SDL_SetWindowGammaRamp", (uintptr_t)&SDL_SetWindowGammaRamp },
+  { "SDL_SetWindowIcon", (uintptr_t)&SDL_SetWindowIcon },
+  { "SDL_ShowMessageBox", (uintptr_t)&SDL_ShowMessageBox },
+  { "SDL_ShowSimpleMessageBox", (uintptr_t)&SDL_ShowSimpleMessageBox },
+  { "SDL_StartTextInput", (uintptr_t)&SDL_StartTextInput },
+  { "SDL_StopTextInput", (uintptr_t)&SDL_StopTextInput },
+  { "SDL_ThreadID", (uintptr_t)&SDL_ThreadID },
+  { "SDL_TryLockMutex", (uintptr_t)&SDL_TryLockMutex },
+  { "SDL_UnlockMutex", (uintptr_t)&SDL_UnlockMutex },
+  { "SDL_WaitThread", (uintptr_t)&SDL_WaitThread },
+  { "SDL_free", (uintptr_t)&SDL_free },
+  { "SDL_setenv", (uintptr_t)&SDL_setenv },
+  { "__ctype_get_mb_cur_max", (uintptr_t)&__ctype_get_mb_cur_max_fake },
   { "__cxa_atexit", (uintptr_t)&__cxa_atexit },
-
-  { "stderr", (uintptr_t)&stderr_fake },
-
-  { "AAssetManager_open", (uintptr_t)&ret0 },
-  { "AAssetManager_fromJava", (uintptr_t)&ret0 },
-  { "AAsset_close", (uintptr_t)&ret0 },
-  { "AAsset_getLength", (uintptr_t)&ret0 },
-  { "AAsset_getRemainingLength", (uintptr_t)&ret0 },
-  { "AAsset_read", (uintptr_t)&ret0 },
-  { "AAsset_seek", (uintptr_t)&ret0 },
-
-  // Not sure how important this is. Used in some init_array.
-  { "pthread_key_create", (uintptr_t)&ret0 },
-  { "pthread_key_delete", (uintptr_t)&ret0 },
-
-  { "pthread_getspecific", (uintptr_t)&ret0 },
-  { "pthread_setspecific", (uintptr_t)&ret0 },
-
-  { "pthread_cond_broadcast", (uintptr_t)&pthread_cond_broadcast_fake },
-  { "pthread_cond_destroy", (uintptr_t)&pthread_cond_destroy_fake },
-  { "pthread_cond_init", (uintptr_t)&pthread_cond_init_fake },
-  { "pthread_cond_signal", (uintptr_t)&pthread_cond_signal_fake },
-  { "pthread_cond_timedwait", (uintptr_t)&pthread_cond_timedwait_fake },
-  { "pthread_cond_wait", (uintptr_t)&pthread_cond_wait_fake },
-
+  { "__cxa_finalize", (uintptr_t)&ret0 },
+  { "__errno", (uintptr_t)&__errno },
+  { "__google_potentially_blocking_region_begin", (uintptr_t)&ret0 },
+  { "__google_potentially_blocking_region_end", (uintptr_t)&ret0 },
+  { "__isnanf", (uintptr_t)&__isnanf_fake },
+  { "__memcpy_chk", (uintptr_t)&__memcpy_chk_fake },
+  { "__memset_chk", (uintptr_t)&__memset_chk_fake },
+  { "__sF", (uintptr_t)&fake_sF },
+  { "__stack_chk_fail", (uintptr_t)&__stack_chk_fail },
+  { "__stack_chk_guard", (uintptr_t)&__stack_chk_guard_fake },
+  { "__strlen_chk", (uintptr_t)&__strlen_chk_fake },
+  { "__strrchr_chk", (uintptr_t)&__strrchr_chk_fake },
+  { "_ctype_", (uintptr_t)&__ctype_ },
+  { "abort", (uintptr_t)&abort },
+  { "accept", (uintptr_t)&accept },
+  { "access", (uintptr_t)&access },
+  { "acos", (uintptr_t)&acos },
+  { "alBufferData", (uintptr_t)&alBufferData_hook },
+  { "alDeleteBuffers", (uintptr_t)&alDeleteBuffers },
+  { "alDeleteSources", (uintptr_t)&alDeleteSources },
+  { "alDistanceModel", (uintptr_t)&alDistanceModel },
+  { "alGenBuffers", (uintptr_t)&alGenBuffers },
+  { "alGenSources", (uintptr_t)&alGenSources },
+  { "alGetEnumValue", (uintptr_t)&alGetEnumValue },
+  { "alGetError", (uintptr_t)&alGetError },
+  { "alGetSourcei", (uintptr_t)&alGetSourcei },
+  { "alGetString", (uintptr_t)&alGetString },
+  { "alIsBuffer", (uintptr_t)&alIsBuffer },
+  { "alIsExtensionPresent", (uintptr_t)&alIsExtensionPresent },
+  { "alIsSource", (uintptr_t)&alIsSource },
+  { "alSource3f", (uintptr_t)&alSource3f },
+  { "alSourcePause", (uintptr_t)&alSourcePause },
+  { "alSourcePlay", (uintptr_t)&alSourcePlay_hook },
+  { "alSourceQueueBuffers", (uintptr_t)&alSourceQueueBuffers_hook },
+  { "alSourceStop", (uintptr_t)&alSourceStop },
+  { "alSourceUnqueueBuffers", (uintptr_t)&alSourceUnqueueBuffers_hook },
+  { "alSourcef", (uintptr_t)&alSourcef_hook },
+  { "alSourcei", (uintptr_t)&alSourcei },
+  { "alcCloseDevice", (uintptr_t)&alcCloseDevice },
+  { "alcCreateContext", (uintptr_t)&alcCreateContextHook },
+  { "alcDestroyContext", (uintptr_t)&alcDestroyContext },
+  { "alcGetContextsDevice", (uintptr_t)&alcGetContextsDevice },
+  { "alcGetCurrentContext", (uintptr_t)&alcGetCurrentContext },
+  { "alcGetError", (uintptr_t)&alcGetError },
+  { "alcGetIntegerv", (uintptr_t)&alcGetIntegerv },
+  { "alcGetProcAddress", (uintptr_t)&alcGetProcAddress_hook },
+  { "alcGetString", (uintptr_t)&alcGetString },
+  { "alcIsExtensionPresent", (uintptr_t)&alcIsExtensionPresent },
+  { "alcMakeContextCurrent", (uintptr_t)&alcMakeContextCurrent },
+  { "alcOpenDevice", (uintptr_t)&alcOpenDeviceHook },
+  { "alcSetThreadContext", (uintptr_t)&alcSetThreadContext },
+  { "atan2", (uintptr_t)&atan2 },
+  { "atof", (uintptr_t)&atof },
+  { "atol", (uintptr_t)&atol },
+  { "bind", (uintptr_t)&bind },
+  { "btowc", (uintptr_t)&btowc },
+  { "calloc", (uintptr_t)&calloc },
+  { "chdir", (uintptr_t)&chdir },
+  { "close", (uintptr_t)&close },
+  { "closedir", (uintptr_t)&closedir },
+  { "connect", (uintptr_t)&connect },
+  { "cos", (uintptr_t)&cos },
+  { "dl_iterate_phdr", (uintptr_t)&dl_iterate_phdr_fake },
+  { "fclose", (uintptr_t)&fclose },
+  { "fcntl", (uintptr_t)&fcntl_fake },
+  { "fdopen", (uintptr_t)&fdopen },
+  { "feof", (uintptr_t)&feof },
+  { "ferror", (uintptr_t)&ferror },
+  { "fflush", (uintptr_t)&fflush },
+  { "fgetc", (uintptr_t)&fgetc },
+  { "fgetpos", (uintptr_t)&fgetpos },
+  { "fgets", (uintptr_t)&fgets },
+  { "fileno", (uintptr_t)&fileno },
+  { "fmod", (uintptr_t)&fmod },
+  { "fopen", (uintptr_t)&fopen_fake },
+  { "fprintf", (uintptr_t)&fprintf },
+  { "fputc", (uintptr_t)&fputc },
+  { "fputs", (uintptr_t)&fputs },
+  { "fread", (uintptr_t)&fread },
+  { "free", (uintptr_t)&free },
+  { "freeaddrinfo", (uintptr_t)&freeaddrinfo },
+  { "freopen", (uintptr_t)&freopen_hook },
+  { "frexp", (uintptr_t)&frexp },
+  { "fscanf", (uintptr_t)&fscanf },
+  { "fseek", (uintptr_t)&fseek },
+  { "fseeko", (uintptr_t)&fseeko },
+  { "fsetpos", (uintptr_t)&fsetpos },
+  { "fstat", (uintptr_t)&fstat_fake },
+  { "fsync", (uintptr_t)&fsync },
+  { "ftell", (uintptr_t)&ftell },
+  { "ftello", (uintptr_t)&ftello },
+  { "ftruncate", (uintptr_t)&ftruncate },
+  { "fwrite", (uintptr_t)&fwrite },
+  { "getaddrinfo", (uintptr_t)&getaddrinfo },
+  { "getc", (uintptr_t)&getc },
+  { "getc_unlocked", (uintptr_t)&getc_unlocked },
+  { "getenv", (uintptr_t)&getenv },
+  { "getnameinfo", (uintptr_t)&getnameinfo },
+  { "getsockname", (uintptr_t)&getsockname },
+  { "getsockopt", (uintptr_t)&getsockopt },
+  { "gettimeofday", (uintptr_t)&gettimeofday },
+  { "getwc", (uintptr_t)&getwc },
+  { "gmtime_r", (uintptr_t)&gmtime_r },
+  { "inet_ntop", (uintptr_t)&inet_ntop },
+  { "inet_pton", (uintptr_t)&inet_pton },
+  { "ioctl", (uintptr_t)&retm1 },
+  { "isalpha", (uintptr_t)&isalpha },
+  { "isprint", (uintptr_t)&isprint },
+  { "isspace", (uintptr_t)&isspace },
+  { "iswcntrl", (uintptr_t)&iswcntrl },
+  { "iswctype", (uintptr_t)&iswctype },
+  { "link", (uintptr_t)&retm1 },
+  { "listen", (uintptr_t)&listen },
+  { "localtime", (uintptr_t)&localtime },
+  { "log", (uintptr_t)&log },
+  { "lrint", (uintptr_t)&lrint },
+  { "lrintf", (uintptr_t)&lrintf },
+  { "lround", (uintptr_t)&lround },
+  { "lseek", (uintptr_t)&lseek },
+  { "malloc", (uintptr_t)&malloc },
+  { "mbrtowc", (uintptr_t)&mbrtowc },
+  { "mbsinit", (uintptr_t)&mbsinit },
+  { "memchr", (uintptr_t)&memchr },
+  { "memcmp", (uintptr_t)&memcmp },
+  { "memcpy", (uintptr_t)&memcpy },
+  { "memmove", (uintptr_t)&memmove },
+  { "memset", (uintptr_t)&memset },
+  { "mkdir", (uintptr_t)&mkdir },
+  { "mpg123_decode", (uintptr_t)&mpg123_decode },
+  { "mpg123_delete", (uintptr_t)&mpg123_delete },
+  { "mpg123_exit", (uintptr_t)&mpg123_exit },
+  { "mpg123_feed", (uintptr_t)&mpg123_feed },
+  { "mpg123_format", (uintptr_t)&mpg123_format },
+  { "mpg123_format_none", (uintptr_t)&mpg123_format_none },
+  { "mpg123_getformat", (uintptr_t)&mpg123_getformat },
+  { "mpg123_init", (uintptr_t)&mpg123_init },
+  { "mpg123_new", (uintptr_t)&mpg123_new },
+  { "mpg123_open_feed", (uintptr_t)&mpg123_open_feed },
+  { "mpg123_read", (uintptr_t)&mpg123_read },
+  { "nanosleep", (uintptr_t)&nanosleep },
+  { "open", (uintptr_t)&open_fake },
+  { "opendir", (uintptr_t)&opendir },
+  { "poll", (uintptr_t)&poll },
+  { "pow", (uintptr_t)&pow },
+  { "printf", (uintptr_t)&debugPrintf },
   { "pthread_create", (uintptr_t)&pthread_create_fake },
+  { "pthread_getspecific", (uintptr_t)&pthread_getspecific },
   { "pthread_join", (uintptr_t)&pthread_join },
-  { "pthread_self", (uintptr_t)&pthread_self },
-
-  { "pthread_setschedparam", (uintptr_t)&ret0 },
-
-  { "pthread_mutexattr_init", (uintptr_t)&ret0 },
-  { "pthread_mutexattr_settype", (uintptr_t)&ret0 },
-  { "pthread_mutexattr_destroy", (uintptr_t)&ret0 },
+  { "pthread_key_create", (uintptr_t)&pthread_key_create },
+  { "pthread_key_delete", (uintptr_t)&pthread_key_delete },
   { "pthread_mutex_destroy", (uintptr_t)&pthread_mutex_destroy_fake },
   { "pthread_mutex_init", (uintptr_t)&pthread_mutex_init_fake },
   { "pthread_mutex_lock", (uintptr_t)&pthread_mutex_lock_fake },
   { "pthread_mutex_unlock", (uintptr_t)&pthread_mutex_unlock_fake },
-
+  { "pthread_mutexattr_destroy", (uintptr_t)&ret0 },
+  { "pthread_mutexattr_init", (uintptr_t)&ret0 },
+  { "pthread_mutexattr_settype", (uintptr_t)&ret0 },
   { "pthread_once", (uintptr_t)&pthread_once_fake },
-
-  { "sched_get_priority_min", (uintptr_t)&retm1 },
-
-  { "__android_log_print", (uintptr_t)__android_log_print },
-
-  { "__errno", (uintptr_t)&__errno },
-
-  { "__stack_chk_fail", (uintptr_t)&__stack_chk_fail },
-  // freezes with real __stack_chk_guard
-  { "__stack_chk_guard", (uintptr_t)&__stack_chk_guard_fake },
-
-  { "_ctype_", (uintptr_t)&__ctype_ },
-
-   // TODO: use math neon?
-  { "acos", (uintptr_t)&acos },
-  { "acosf", (uintptr_t)&acosf },
-  { "asinf", (uintptr_t)&asinf },
-  { "atan2f", (uintptr_t)&atan2f },
-  { "atanf", (uintptr_t)&atanf },
-  { "cos", (uintptr_t)&cos },
-  { "cosf", (uintptr_t)&cosf },
-  { "exp", (uintptr_t)&exp },
-  { "floor", (uintptr_t)&floor },
-  { "floorf", (uintptr_t)&floorf },
-  { "fmod", (uintptr_t)&fmod },
-  { "fmodf", (uintptr_t)&fmodf },
-  { "log", (uintptr_t)&log },
-  { "log10f", (uintptr_t)&log10f },
-  { "pow", (uintptr_t)&pow },
-  { "powf", (uintptr_t)&powf },
+  { "pthread_setspecific", (uintptr_t)&pthread_setspecific },
+  { "putc", (uintptr_t)&putc },
+  { "putchar", (uintptr_t)&putchar },
+  { "puts", (uintptr_t)&puts },
+  { "putwc", (uintptr_t)&putwc },
+  { "qsort", (uintptr_t)&qsort },
+  { "read", (uintptr_t)&read },
+  { "readdir", (uintptr_t)&readdir_fake },
+  { "realloc", (uintptr_t)&realloc },
+  { "recvmsg", (uintptr_t)&recvmsg },
+  { "remove", (uintptr_t)&remove },
+  { "rename", (uintptr_t)&rename },
+  { "rewind", (uintptr_t)&rewind },
+  { "rmdir", (uintptr_t)&rmdir },
+  { "select", (uintptr_t)&select },
+  { "sendmsg", (uintptr_t)&sendmsg },
+  { "setlocale", (uintptr_t)&setlocale },
+  { "setsockopt", (uintptr_t)&setsockopt_fake },
+  { "setvbuf", (uintptr_t)&setvbuf },
+  { "shutdown", (uintptr_t)&shutdown },
   { "sin", (uintptr_t)&sin },
   { "sinf", (uintptr_t)&sinf },
-  { "tan", (uintptr_t)&tan },
-  { "tanf", (uintptr_t)&tanf },
+  { "snprintf", (uintptr_t)&snprintf },
+  { "socket", (uintptr_t)&socket },
+  { "sprintf", (uintptr_t)&sprintf },
   { "sqrt", (uintptr_t)&sqrt },
   { "sqrtf", (uintptr_t)&sqrtf },
-
-  { "atoi", (uintptr_t)&atoi },
-  { "atof", (uintptr_t)&atof },
-  { "isspace", (uintptr_t)&isspace },
-  { "tolower", (uintptr_t)&tolower },
-  { "towlower", (uintptr_t)&towlower },
-  { "toupper", (uintptr_t)&toupper },
-  { "towupper", (uintptr_t)&towupper },
-
-  { "calloc", (uintptr_t)&calloc },
-  { "free", (uintptr_t)&free },
-  { "malloc", (uintptr_t)&malloc },
-  { "realloc", (uintptr_t)&realloc },
-
-  { "clock_gettime", (uintptr_t)&clock_gettime },
-  { "gettimeofday", (uintptr_t)&gettimeofday },
-  { "time", (uintptr_t)&time },
-  { "asctime", (uintptr_t)&asctime },
-  { "localtime", (uintptr_t)&localtime },
-  { "localtime_r", (uintptr_t)&localtime_r },
-  { "strftime", (uintptr_t)&strftime },
-
-  { "eglGetProcAddress", (uintptr_t)&eglGetProcAddress },
-  { "eglGetDisplay", (uintptr_t)&eglGetDisplay },
-  { "eglQueryString", (uintptr_t)&eglQueryString },
-
-  { "abort", (uintptr_t)&abort },
-  { "exit", (uintptr_t)&exit },
-
-  { "fopen", (uintptr_t)&fopen },
-  { "fclose", (uintptr_t)&fclose },
-  { "fdopen", (uintptr_t)&fdopen },
-  { "fflush", (uintptr_t)&fflush },
-  { "fgetc", (uintptr_t)&fgetc },
-  { "fgets", (uintptr_t)&fgets },
-  { "fputs", (uintptr_t)&fputs },
-  { "fputc", (uintptr_t)&fputc },
-  { "fprintf", (uintptr_t)&fprintf },
-  { "fread", (uintptr_t)&fread },
-  { "fseek", (uintptr_t)&fseek },
-  { "ftell", (uintptr_t)&ftell },
-  { "fwrite", (uintptr_t)&fwrite },
-  { "fstat", (uintptr_t)&fstat },
-  { "ferror", (uintptr_t)&ferror },
-  { "feof", (uintptr_t)&feof },
-  { "setvbuf", (uintptr_t)&setvbuf },
-
-  { "getenv", (uintptr_t)&getenv },
-
-  { "glActiveTexture", (uintptr_t)&glActiveTexture },
-  { "glAttachShader", (uintptr_t)&glAttachShader },
-  { "glBindAttribLocation", (uintptr_t)&glBindAttribLocation },
-  { "glBindBuffer", (uintptr_t)&glBindBuffer },
-  { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer },
-  { "glBindRenderbuffer", (uintptr_t)&glBindRenderbuffer },
-  { "glBindTexture", (uintptr_t)&glBindTexture },
-  { "glBlendFunc", (uintptr_t)&glBlendFunc },
-  { "glBlendFuncSeparate", (uintptr_t)&glBlendFuncSeparate },
-  { "glBufferData", (uintptr_t)&glBufferData },
-  { "glCheckFramebufferStatus", (uintptr_t)&glCheckFramebufferStatus },
-  { "glClear", (uintptr_t)&glClear },
-  { "glClearColor", (uintptr_t)&glClearColor },
-  { "glClearDepthf", (uintptr_t)&glClearDepthf },
-  { "glClearStencil", (uintptr_t)&glClearStencil },
-  { "glCompileShader", (uintptr_t)&glCompileShader },
-  { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D },
-  { "glCreateProgram", (uintptr_t)&glCreateProgram },
-  { "glCreateShader", (uintptr_t)&glCreateShader },
-  { "glCullFace", (uintptr_t)&glCullFace },
-  { "glDeleteBuffers", (uintptr_t)&glDeleteBuffers },
-  { "glDeleteFramebuffers", (uintptr_t)&glDeleteFramebuffers },
-  { "glDeleteProgram", (uintptr_t)&glDeleteProgram },
-  { "glDeleteRenderbuffers", (uintptr_t)&glDeleteRenderbuffers },
-  { "glDeleteShader", (uintptr_t)&glDeleteShader },
-  { "glDeleteTextures", (uintptr_t)&glDeleteTextures },
-  { "glDepthFunc", (uintptr_t)&glDepthFunc },
-  { "glDepthMask", (uintptr_t)&glDepthMask },
-  { "glDepthRangef", (uintptr_t)&glDepthRangef },
-  { "glDisable", (uintptr_t)&glDisable },
-  { "glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray },
-  { "glDrawArrays", (uintptr_t)&glDrawArrays },
-  { "glDrawElements", (uintptr_t)&glDrawElements },
-  { "glEnable", (uintptr_t)&glEnable },
-  { "glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray },
-  { "glFinish", (uintptr_t)&glFinish },
-  { "glFramebufferRenderbuffer", (uintptr_t)&glFramebufferRenderbuffer },
-  { "glFramebufferTexture2D", (uintptr_t)&glFramebufferTexture2D },
-  { "glFrontFace", (uintptr_t)&glFrontFace },
-  { "glGenBuffers", (uintptr_t)&glGenBuffers },
-  { "glGenFramebuffers", (uintptr_t)&glGenFramebuffers },
-  { "glGenRenderbuffers", (uintptr_t)&glGenRenderbuffers },
-  { "glGenTextures", (uintptr_t)&glGenTextures },
-  { "glGetAttribLocation", (uintptr_t)&glGetAttribLocation },
-  { "glGetError", (uintptr_t)&glGetError },
-  { "glGetBooleanv", (uintptr_t)&glGetBooleanv },
-  { "glGetIntegerv", (uintptr_t)&glGetIntegerv },
-  { "glGetProgramInfoLog", (uintptr_t)&glGetProgramInfoLog },
-  { "glGetProgramiv", (uintptr_t)&glGetProgramiv },
-  { "glGetShaderInfoLog", (uintptr_t)&glGetShaderInfoLogHook },
-  { "glGetShaderiv", (uintptr_t)&glGetShaderiv },
-  { "glGetString", (uintptr_t)&glGetString },
-  { "glGetUniformLocation", (uintptr_t)&glGetUniformLocation },
-  { "glHint", (uintptr_t)&glHint },
-  { "glLinkProgram", (uintptr_t)&glLinkProgram },
-  { "glPolygonOffset", (uintptr_t)&glPolygonOffset },
-  { "glReadPixels", (uintptr_t)&glReadPixels },
-  { "glRenderbufferStorage", (uintptr_t)&glRenderbufferStorage },
-  { "glScissor", (uintptr_t)&glScissor },
-  { "glShaderSource", (uintptr_t)&glShaderSource },
-  { "glTexImage2D", (uintptr_t)&glTexImage2D },
-  { "glTexParameterf", (uintptr_t)&glTexParameterf },
-  { "glTexParameteri", (uintptr_t)&glTexParameteri },
-  { "glUniform1f", (uintptr_t)&glUniform1f },
-  { "glUniform1fv", (uintptr_t)&glUniform1fv },
-  { "glUniform1i", (uintptr_t)&glUniform1i },
-  { "glUniform2fv", (uintptr_t)&glUniform2fv },
-  { "glUniform3f", (uintptr_t)&glUniform3f },
-  { "glUniform3fv", (uintptr_t)&glUniform3fv },
-  { "glUniform4fv", (uintptr_t)&glUniform4fv },
-  { "glUniformMatrix3fv", (uintptr_t)&glUniformMatrix3fv },
-  { "glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv },
-  { "glUseProgram", (uintptr_t)&glUseProgram },
-  { "glVertexAttrib4fv", (uintptr_t)&glVertexAttrib4fv },
-  { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
-  { "glViewport", (uintptr_t)&glViewport },
-
-  // this only uses setjmp in the JPEG loader but not longjmp
-  // probably doesn't matter if they're compatible or not
-  { "setjmp", (uintptr_t)&setjmp },
-
-  { "memcmp", (uintptr_t)&memcmp },
-  { "wmemcmp", (uintptr_t)&wmemcmp },
-  { "memcpy", (uintptr_t)&memcpy },
-  { "memmove", (uintptr_t)&memmove },
-  { "memset", (uintptr_t)&memset },
-  { "memchr", (uintptr_t)&memchr },
-
-  { "printf", (uintptr_t)&debugPrintf },
-
-  { "bsearch", (uintptr_t)&bsearch },
-  { "qsort", (uintptr_t)&qsort },
-
-  { "snprintf", (uintptr_t)&snprintf },
-  { "sprintf", (uintptr_t)&sprintf },
-  { "vsnprintf", (uintptr_t)&vsnprintf },
-  { "vsprintf", (uintptr_t)&vsprintf },
-
   { "sscanf", (uintptr_t)&sscanf },
-
-  { "close", (uintptr_t)&close },
-  { "lseek", (uintptr_t)&lseek },
-  { "mkdir", (uintptr_t)&mkdir },
-  { "open", (uintptr_t)&open },
-  { "read", (uintptr_t)&read },
-  { "stat", (uintptr_t)stat },
-  { "write", (uintptr_t)&write },
-
-  { "strcasecmp", (uintptr_t)&strcasecmp },
+  { "stat", (uintptr_t)&stat_fake },
+  { "stpcpy", (uintptr_t)&stpcpy },
   { "strcat", (uintptr_t)&strcat },
   { "strchr", (uintptr_t)&strchr },
   { "strcmp", (uintptr_t)&strcmp },
   { "strcoll", (uintptr_t)&strcoll },
   { "strcpy", (uintptr_t)&strcpy },
-  { "stpcpy", (uintptr_t)&stpcpy },
+  { "strdup", (uintptr_t)&strdup },
   { "strerror", (uintptr_t)&strerror },
+  { "strftime", (uintptr_t)&strftime },
   { "strlen", (uintptr_t)&strlen },
-  { "strncasecmp", (uintptr_t)&strncasecmp },
   { "strncat", (uintptr_t)&strncat },
   { "strncmp", (uintptr_t)&strncmp },
   { "strncpy", (uintptr_t)&strncpy },
-  { "strpbrk", (uintptr_t)&strpbrk },
+  { "strnlen", (uintptr_t)&strnlen },
   { "strrchr", (uintptr_t)&strrchr },
   { "strstr", (uintptr_t)&strstr },
   { "strtod", (uintptr_t)&strtod },
-  { "strtok", (uintptr_t)&strtok },
-  { "strtol", (uintptr_t)&strtol },
-  { "strtoul", (uintptr_t)&strtoul },
   { "strtof", (uintptr_t)&strtof },
+  { "strtol", (uintptr_t)&strtol },
+  { "strtold", (uintptr_t)&strtold },
   { "strxfrm", (uintptr_t)&strxfrm },
-
-  { "srand", (uintptr_t)&srand },
-  { "rand", (uintptr_t)&rand },
-
-  { "nanosleep", (uintptr_t)&nanosleep },
-  { "usleep", (uintptr_t)&usleep },
-
-  { "wctob", (uintptr_t)&wctob },
-  { "wctype", (uintptr_t)&wctype },
-  { "wcsxfrm", (uintptr_t)&wcsxfrm },
-  { "iswctype", (uintptr_t)&iswctype },
+  { "syscall", (uintptr_t)&syscall_fake },
+  { "time", (uintptr_t)&time },
+  { "tolower", (uintptr_t)&tolower },
+  { "toupper", (uintptr_t)&toupper },
+  { "towlower", (uintptr_t)&towlower },
+  { "towupper", (uintptr_t)&towupper },
+  { "ungetc", (uintptr_t)&ungetc },
+  { "ungetwc", (uintptr_t)&ungetwc },
+  { "uselocale", (uintptr_t)&uselocale },
+  { "vsnprintf", (uintptr_t)&vsnprintf },
+  { "vsprintf", (uintptr_t)&vsprintf },
+  { "wcrtomb", (uintptr_t)&wcrtomb },
   { "wcscoll", (uintptr_t)&wcscoll },
   { "wcsftime", (uintptr_t)&wcsftime },
-  { "mbrtowc", (uintptr_t)&mbrtowc },
-  { "wcrtomb", (uintptr_t)&wcrtomb },
   { "wcslen", (uintptr_t)&wcslen },
-  { "btowc", (uintptr_t)&btowc },
+  { "wcsxfrm", (uintptr_t)&wcsxfrm },
+  { "wctob", (uintptr_t)&wctob },
+  { "wctype", (uintptr_t)&wctype },
+  { "wcwidth", (uintptr_t)&wcwidth },
+  { "wmemchr", (uintptr_t)&wmemchr },
+  { "wmemcmp", (uintptr_t)&wmemcmp },
+  { "wmemcpy", (uintptr_t)&wmemcpy },
+  { "wmemmove", (uintptr_t)&wmemmove },
+  { "wmemset", (uintptr_t)&wmemset },
+  { "write", (uintptr_t)&write },
+  { "writev", (uintptr_t)&writev_fake },
 };
 
 size_t dynlib_numfunctions = sizeof(dynlib_functions) / sizeof(*dynlib_functions);
 
 void update_imports(void) {
-  // only use the hooks if the relevant config options are enabled to avoid possible overhead
-  if (config.disable_mipmaps)
-    so_find_import(dynlib_functions, dynlib_numfunctions, "glCompressedTexImage2D")->func = (uintptr_t)glCompressedTexImage2DHook;
-  if (config.trilinear_filter)
-    so_find_import(dynlib_functions, dynlib_numfunctions, "glTexParameteri")->func = (uintptr_t)glTexParameteriHook;
 }

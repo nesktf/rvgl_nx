@@ -62,6 +62,7 @@ int debugPrintf(char *text, ...) {
   va_start(list, text);
   vprintf(text, list);
   va_end(list);
+  fflush(stdout);
 #endif
   return 0;
 }

@@ -6,6 +6,7 @@
  * of the MIT license.  See the LICENSE file for details.
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -21,6 +22,10 @@
 
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
+
+so_module so_sndfile;
+so_module so_unistring;
+so_module so_main;
 
 // provide replacement heap init function to separate newlib heap from the .so
 void __libnx_initheap(void) {
@@ -55,32 +60,11 @@ void __libnx_initheap(void) {
   heap_so_limit = (char *)addr + size - (char *)heap_so_base;
 }
 
+
 static void check_data(void) {
-  const char *files[] = {
-    "MaxPayneSoundsv2.msf",
-    "x_data.ras",
-    "x_english.ras",
-    "x_level1.ras",
-    "x_level2.ras",
-    "x_level3.ras",
-    "data",
-    "es2",
-    // if this is missing, assets folder hasn't been merged in
-    "es2/DefaultPixel.txt",
-    // mod file goes here
-    "",
-  };
   struct stat st;
-  unsigned int numfiles = (sizeof(files) / sizeof(*files)) - 1;
-  // if mod is enabled, also check for mod file
-  if (config.mod_file[0])
-    files[numfiles++] = config.mod_file;
-  // check if all the required files are present
-  for (unsigned int i = 0; i < numfiles; ++i) {
-    if (stat(files[i], &st) < 0) {
-      fatal_error("Could not find\n%s.\nCheck your data files.", files[i]);
-      break;
-    }
+  if (stat(SO_NAME, &st) < 0) {
+    fatal_error("Could not find\n%s.\nCheck your /switch/rvgl installation.", SO_NAME);
   }
 }
 
@@ -97,7 +81,6 @@ static void check_syscalls(void) {
 
 static void set_screen_size(int w, int h) {
   if (w <= 0 || h <= 0 || w > 1920 || h > 1080) {
-    // auto; pick resolution based on docked mode
     if (appletGetOperationMode() == AppletOperationMode_Console) {
       screen_width = 1920;
       screen_height = 1080;
@@ -112,64 +95,181 @@ static void set_screen_size(int w, int h) {
   debugPrintf("screen mode: %dx%d\n", screen_width, screen_height);
 }
 
-int main(void) {
-  // try to read the config file and create one with default values if it's missing
-  if (read_config(CONFIG_NAME) < 0)
-    write_config(CONFIG_NAME);
+static void write_rvgl_ini(const char *path) {
+  FILE *f = fopen(path, "w");
+  if (f) {
+    fprintf(f,
+      "[Game]\n"
+      "Language = 3\n"
+      "\n"
+      "[Video]\n"
+      "ScreenWidth = 1280\n"
+      "ScreenHeight = 720\n"
+      "Shaders = 1\n"
+      "Threaded = 0\n"
+      "\n"
+      "[Audio]\n"
+      "MusicOn = 1\n"
+      "MusicVol = 100\n"
+      "SfxVol = 100\n"
+      "SfxChannels = 16\n"
+      "SampleRate = 48000\n"
+      "\n"
+      "[Misc]\n"
+      "DemoTimeout = 0\n"
+    );
+    fclose(f);
+    debugPrintf("Wrote config to %s\n", path);
+  }
+}
+
+int main(int argc, char *argv[]) {
+  // Ensure working directory is the game folder
+  chdir("/switch/rvgl");
+
+  // Create required directories if they don't exist
+  mkdir("/switch/rvgl/profiles", 0777);
+  mkdir("/switch/rvgl/profiles/t", 0777);
+  mkdir("/switch/rvgl/replays", 0777);
+  mkdir("/switch/rvgl/cache", 0777);
+  mkdir("/switch/rvgl/cache/shaders", 0777);
+
+  // Check and create default configs if missing
+  struct stat st_ini;
+  if (stat("/switch/rvgl/profiles/rvgl.ini", &st_ini) < 0) {
+    write_rvgl_ini("/switch/rvgl/profiles/rvgl.ini");
+  }
+  if (stat("/switch/rvgl/rvgl.ini", &st_ini) < 0) {
+    write_rvgl_ini("/switch/rvgl/rvgl.ini");
+  }
+
+  // Ensure profiles/t/profile.ini has audio settings
+  struct stat st_prof;
+  if (stat("/switch/rvgl/profiles/t/profile.ini", &st_prof) < 0) {
+    FILE *fp = fopen("/switch/rvgl/profiles/t/profile.ini", "w");
+    if (fp) {
+      fprintf(fp,
+        "[Audio]\n"
+        "MusicOn = 1\n"
+        "MusicVol = 100\n"
+        "SfxVol = 100\n"
+        "SfxChannels = 16\n"
+        "SampleRate = 48000\n"
+      );
+      fclose(fp);
+    }
+  }
 
   check_syscalls();
-  //check_data();
+  check_data();
 
-  // calculate actual screen size
   set_screen_size(config.screen_width, config.screen_height);
 
-  debugPrintf("heap size = %u KB\n", MEMORY_MB * 1024);
+  debugPrintf("heap size = %u KB\n", (u32)(MEMORY_MB * 1024));
   debugPrintf(" lib base = %p\n", heap_so_base);
-  debugPrintf("  lib max = %u KB\n", heap_so_limit / 1024);
+  debugPrintf("  lib max = %u KB\n", (u32)(heap_so_limit / 1024));
 
-  if (so_load(SO_NAME, heap_so_base, heap_so_limit) < 0)
+
+  void *cur_so_base = heap_so_base;
+  size_t cur_so_limit = heap_so_limit;
+
+  // 1. Load libsndfile.so if available
+  int has_sndfile = (so_load(&so_sndfile, "libsndfile.so", cur_so_base, cur_so_limit) == 0);
+  if (has_sndfile) {
+    debugPrintf("Loaded libsndfile.so\n");
+    cur_so_base = (char *)cur_so_base + so_sndfile.load_size;
+    cur_so_limit -= so_sndfile.load_size;
+  } else {
+    debugPrintf("libsndfile.so not found (optional)\n");
+  }
+
+  // 2. Load libunistring.so if available
+  int has_unistring = (so_load(&so_unistring, "libunistring.so", cur_so_base, cur_so_limit) == 0);
+  if (has_unistring) {
+    debugPrintf("Loaded libunistring.so\n");
+    cur_so_base = (char *)cur_so_base + so_unistring.load_size;
+    cur_so_limit -= so_unistring.load_size;
+  } else {
+    debugPrintf("libunistring.so not found (optional)\n");
+  }
+
+  // 3. Load main game binary (libmain.so)
+  if (so_load(&so_main, SO_NAME, cur_so_base, cur_so_limit) < 0)
     fatal_error("Could not load\n%s.", SO_NAME);
+  debugPrintf("Loaded %s\n", SO_NAME);
 
-  // won't save without it
-  //mkdir("savegames", 0777);
+  // Relocate loaded modules
+  debugPrintf("Relocating modules...\n");
+  if (has_sndfile) so_relocate(&so_sndfile);
+  if (has_unistring) so_relocate(&so_unistring);
+  so_relocate(&so_main);
 
-  update_imports();
+  // Resolve imports
+  debugPrintf("Resolving imports...\n");
+  if (has_sndfile) so_resolve(&so_sndfile, dynlib_functions, dynlib_numfunctions, 0);
+  if (has_unistring) so_resolve(&so_unistring, dynlib_functions, dynlib_numfunctions, 0);
+  so_resolve(&so_main, dynlib_functions, dynlib_numfunctions, 1);
 
-  so_relocate();
-  so_resolve(dynlib_functions, dynlib_numfunctions, 1);
-
+  // Apply patches / hooks
+  debugPrintf("Patching hooks...\n");
   patch_openal();
-  //patch_opengl();
-  //patch_game();
+  patch_opengl();
+  patch_game();
 
-  // can't set it in the initializer because it's not constant
-  stderr_fake = stderr;
+  // Find game entrypoint
+  debugPrintf("Resolving SDL_main entrypoint...\n");
+  int (*SDL_main_func)(int argc, char *argv[]) = (void *)so_find_addr_rx(&so_main, "SDL_main");
+  if (!SDL_main_func)
+    fatal_error("Could not find SDL_main in\n%s.", SO_NAME);
+  debugPrintf("Found SDL_main at %p\n", SDL_main_func);
 
-  int (*NVEventAppMain)(int argc, char* argv[]) = (void*)so_find_addr_rx("SDL_main");
+  // Map memory permissions (RX for code, RW for data)
+  debugPrintf("Finalizing memory mappings...\n");
+  if (has_sndfile) so_finalize(&so_sndfile);
+  if (has_unistring) so_finalize(&so_unistring);
+  so_finalize(&so_main);
 
-#if 0
-  strcpy((char *)so_find_addr("StorageRootBuffer"), ".");
-  *(uint8_t *)so_find_addr("IsAndroidPaused") = 0;
-  *(uint8_t *)so_find_addr("UseRGBA8") = 1; // RGB565 FBOs suck
+  // Flush instruction caches
+  debugPrintf("Flushing caches...\n");
+  if (has_sndfile) so_flush_caches(&so_sndfile);
+  if (has_unistring) so_flush_caches(&so_unistring);
+  so_flush_caches(&so_main);
 
-  uint32_t (* initGraphics)(void) = (void *)so_find_addr_rx("_Z12initGraphicsv");
-  uint32_t (* ShowJoystick)(int show) = (void *)so_find_addr_rx("_Z12ShowJoystickb");
-  int (* NVEventAppMain)(int argc, char *argv[]) = (void *)so_find_addr_rx("_Z14NVEventAppMainiPPc");
-#endif
+  // Execute C++ global constructors (.init_array)
+  debugPrintf("Executing init_arrays...\n");
+  if (has_sndfile) so_execute_init_array(&so_sndfile);
+  if (has_unistring) so_execute_init_array(&so_unistring);
+  so_execute_init_array(&so_main);
 
-  so_finalize();
-  so_flush_caches();
+  // Free temp ELF images
+  debugPrintf("Freeing temp images...\n");
+  if (has_sndfile) so_free_temp(&so_sndfile);
+  if (has_unistring) so_free_temp(&so_unistring);
+  so_free_temp(&so_main);
 
-  //so_execute_init_array();
+  debugPrintf("Starting SDL_main at %p...\n", SDL_main_func);
 
-  so_free_temp();
+  // Determine basepath: if assets are in /switch/rvgl/assets, point to that
+  struct stat st;
+  const char *basepath = "/switch/rvgl";
+  if (stat("/switch/rvgl/assets/models/go2.m", &st) == 0 || stat("assets/models/go2.m", &st) == 0) {
+    basepath = "/switch/rvgl/assets";
+  }
 
-#if 0
-  initGraphics();
-  ShowJoystick(0);
-#endif
-  __builtin_trap();
-  NVEventAppMain(0, NULL);
+  char *game_argv[] = {
+    "rvgl",
+    "-basepath",
+    (char *)basepath,
+    "-prefpath",
+    "/switch/rvgl",
+    NULL
+  };
+  int game_argc = 5;
 
-  return 0;
+  debugPrintf("Running with basepath: %s\n", basepath);
+
+  int ret = SDL_main_func(game_argc, game_argv);
+  debugPrintf("SDL_main returned %d\n", ret);
+
+  return ret;
 }
