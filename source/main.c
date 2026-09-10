@@ -118,7 +118,7 @@ int main(void) {
     write_config(CONFIG_NAME);
 
   check_syscalls();
-  check_data();
+  //check_data();
 
   // calculate actual screen size
   set_screen_size(config.screen_width, config.screen_height);
@@ -131,7 +131,7 @@ int main(void) {
     fatal_error("Could not load\n%s.", SO_NAME);
 
   // won't save without it
-  mkdir("savegames", 0777);
+  //mkdir("savegames", 0777);
 
   update_imports();
 
@@ -139,12 +139,15 @@ int main(void) {
   so_resolve(dynlib_functions, dynlib_numfunctions, 1);
 
   patch_openal();
-  patch_opengl();
-  patch_game();
+  //patch_opengl();
+  //patch_game();
 
   // can't set it in the initializer because it's not constant
   stderr_fake = stderr;
 
+  int (*NVEventAppMain)(int argc, char* argv[]) = (void*)so_find_addr_rx("SDL_main");
+
+#if 0
   strcpy((char *)so_find_addr("StorageRootBuffer"), ".");
   *(uint8_t *)so_find_addr("IsAndroidPaused") = 0;
   *(uint8_t *)so_find_addr("UseRGBA8") = 1; // RGB565 FBOs suck
@@ -152,16 +155,20 @@ int main(void) {
   uint32_t (* initGraphics)(void) = (void *)so_find_addr_rx("_Z12initGraphicsv");
   uint32_t (* ShowJoystick)(int show) = (void *)so_find_addr_rx("_Z12ShowJoystickb");
   int (* NVEventAppMain)(int argc, char *argv[]) = (void *)so_find_addr_rx("_Z14NVEventAppMainiPPc");
+#endif
 
   so_finalize();
   so_flush_caches();
 
-  so_execute_init_array();
+  //so_execute_init_array();
 
   so_free_temp();
 
+#if 0
   initGraphics();
   ShowJoystick(0);
+#endif
+  __builtin_trap();
   NVEventAppMain(0, NULL);
 
   return 0;

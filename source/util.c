@@ -16,6 +16,7 @@
 #include "util.h"
 #include "config.h"
 
+#define DEBUG_LOG
 #ifdef DEBUG_LOG
 
 static int s_nxlinkSock = -1;
