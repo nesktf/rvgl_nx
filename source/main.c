@@ -63,43 +63,6 @@ void __libnx_initheap(void) {
 
 #include <dirent.h>
 
-static void dump_latest_crash_report(void) {
-  DIR *d = opendir("/atmosphere/crash_reports");
-  if (!d) d = opendir("sdmc:/atmosphere/crash_reports");
-  if (!d) return;
-
-  struct dirent *ent;
-  char latest_file[512] = {0};
-  time_t latest_mtime = 0;
-
-  while ((ent = readdir(d))) {
-    if (ent->d_name[0] == '.') continue;
-    char path[512];
-    snprintf(path, sizeof(path), "/atmosphere/crash_reports/%s", ent->d_name);
-    struct stat st;
-    if (stat(path, &st) == 0) {
-      if (st.st_mtime > latest_mtime) {
-        latest_mtime = st.st_mtime;
-        snprintf(latest_file, sizeof(latest_file), "%s", path);
-      }
-    }
-  }
-  closedir(d);
-
-  if (latest_file[0] != '\0') {
-    debugPrintf("[CrashReport] Latest Atmosphere crash report: %s\n", latest_file);
-    FILE *f = fopen(latest_file, "r");
-    if (f) {
-      char line[256];
-      int count = 0;
-      while (fgets(line, sizeof(line), f) && count++ < 35) {
-        debugPrintf("[CrashDump] %s", line);
-      }
-      fclose(f);
-    }
-  }
-}
-
 static void check_data(void) {
   struct stat st;
   if (stat(SO_NAME, &st) < 0) {
@@ -207,7 +170,7 @@ int main(int argc, char *argv[]) {
 
   // Create required directories if they don't exist
   mkdir("/switch/rvgl/profiles", 0777);
-  mkdir("/switch/rvgl/profiles/t", 0777);
+  mkdir("/switch/rvgl/profiles/default", 0777);
   mkdir("/switch/rvgl/replays", 0777);
   mkdir("/switch/rvgl/cache", 0777);
   mkdir("/switch/rvgl/cache/shaders", 0777);
@@ -221,10 +184,10 @@ int main(int argc, char *argv[]) {
     write_rvgl_ini("/switch/rvgl/rvgl.ini");
   }
 
-  // Ensure profiles/t/profile.ini has audio and joystick settings
+  // Init default profile
   struct stat st_prof;
-  if (stat("/switch/rvgl/profiles/t/profile.ini", &st_prof) < 0) {
-    FILE *fp = fopen("/switch/rvgl/profiles/t/profile.ini", "w");
+  if (stat("/switch/rvgl/profiles/default/profile.ini", &st_prof) < 0) {
+    FILE *fp = fopen("/switch/rvgl/profiles/default/profile.ini", "w");
     if (fp) {
       fprintf(fp,
         "[Audio]\n"
@@ -234,34 +197,26 @@ int main(int argc, char *argv[]) {
         "SfxChannels = 16\n"
         "SampleRate = 48000\n"
         "\n"
+        "[Controller1]\n"
+        "ButtonOpacity = 0\n"
+        "Joystick = 0\n"
+        "KeyPause = 0x01ff0006\n" // map pause to start
+        "\n"
         "[Joystick]\n"
         "Controller1 = 0\n"
       );
       fclose(fp);
     }
-  } else {
-    FILE *fp = fopen("/switch/rvgl/profiles/t/profile.ini", "r+");
-    if (fp) {
-      char content[4096] = {0};
-      size_t read_bytes = fread(content, 1, sizeof(content) - 1, fp);
-      if (read_bytes > 0 && strstr(content, "Controller1") == NULL) {
-        fseek(fp, 0, SEEK_END);
-        fprintf(fp, "\n[Joystick]\nController1 = 0\n");
-      }
-      fclose(fp);
-    }
   }
-
-  dump_latest_crash_report();
 
   check_syscalls();
   check_data();
 
   set_screen_size(config.screen_width, config.screen_height);
 
-  debugPrintf("heap size = %u KB\n", (u32)(MEMORY_MB * 1024));
-  debugPrintf(" lib base = %p\n", heap_so_base);
-  debugPrintf("  lib max = %u KB\n", (u32)(heap_so_limit / 1024));
+  printf("heap size = %u KB\n", (u32)(MEMORY_MB * 1024));
+  printf(" lib base = %p\n", heap_so_base);
+  printf("  lib max = %u KB\n", (u32)(heap_so_limit / 1024));
 
 
   void *cur_so_base = heap_so_base;
@@ -270,78 +225,78 @@ int main(int argc, char *argv[]) {
   // 1. Load libsndfile.so if available
   int has_sndfile = (so_load(&so_sndfile, "libsndfile.so", cur_so_base, cur_so_limit) == 0);
   if (has_sndfile) {
-    debugPrintf("Loaded libsndfile.so\n");
+    printf("Loaded libsndfile.so\n");
     cur_so_base = (char *)cur_so_base + so_sndfile.load_size;
     cur_so_limit -= so_sndfile.load_size;
   } else {
-    debugPrintf("libsndfile.so not found (optional)\n");
+    fprintf(stderr, "libsndfile.so not found (optional)\n");
   }
 
   // 2. Load libunistring.so if available
   int has_unistring = (so_load(&so_unistring, "libunistring.so", cur_so_base, cur_so_limit) == 0);
   if (has_unistring) {
-    debugPrintf("Loaded libunistring.so\n");
+    printf("Loaded libunistring.so\n");
     cur_so_base = (char *)cur_so_base + so_unistring.load_size;
     cur_so_limit -= so_unistring.load_size;
   } else {
-    debugPrintf("libunistring.so not found (optional)\n");
+    fprintf(stderr, "libunistring.so not found (optional)\n");
   }
 
   // 3. Load main game binary (libmain.so)
   if (so_load(&so_main, SO_NAME, cur_so_base, cur_so_limit) < 0)
     fatal_error("Could not load\n%s.", SO_NAME);
-  debugPrintf("Loaded %s\n", SO_NAME);
+  printf("Loaded %s\n", SO_NAME);
 
   // Relocate loaded modules
-  debugPrintf("Relocating modules...\n");
+  printf("Relocating modules...\n");
   if (has_sndfile) so_relocate(&so_sndfile);
   if (has_unistring) so_relocate(&so_unistring);
   so_relocate(&so_main);
 
   // Resolve imports
-  debugPrintf("Resolving imports...\n");
+  printf("Resolving imports...\n");
   if (has_sndfile) so_resolve(&so_sndfile, dynlib_functions, dynlib_numfunctions, 0);
   if (has_unistring) so_resolve(&so_unistring, dynlib_functions, dynlib_numfunctions, 0);
   so_resolve(&so_main, dynlib_functions, dynlib_numfunctions, 1);
 
   // Apply patches / hooks
-  debugPrintf("Patching hooks...\n");
+  printf("Patching hooks...\n");
   patch_openal();
   patch_opengl();
   patch_game();
 
   // Find game entrypoint
-  debugPrintf("Resolving SDL_main entrypoint...\n");
+  printf("Resolving SDL_main entrypoint...\n");
   int (*SDL_main_func)(int argc, char *argv[]) = (void *)so_find_addr_rx(&so_main, "SDL_main");
   if (!SDL_main_func)
     fatal_error("Could not find SDL_main in\n%s.", SO_NAME);
-  debugPrintf("Found SDL_main at %p\n", SDL_main_func);
+  printf("Found SDL_main at %p\n", SDL_main_func);
 
   // Map memory permissions (RX for code, RW for data)
-  debugPrintf("Finalizing memory mappings...\n");
+  printf("Finalizing memory mappings...\n");
   if (has_sndfile) so_finalize(&so_sndfile);
   if (has_unistring) so_finalize(&so_unistring);
   so_finalize(&so_main);
 
   // Flush instruction caches
-  debugPrintf("Flushing caches...\n");
+  printf("Flushing caches...\n");
   if (has_sndfile) so_flush_caches(&so_sndfile);
   if (has_unistring) so_flush_caches(&so_unistring);
   so_flush_caches(&so_main);
 
   // Execute C++ global constructors (.init_array)
-  debugPrintf("Executing init_arrays...\n");
+  printf("Executing init_arrays...\n");
   if (has_sndfile) so_execute_init_array(&so_sndfile);
   if (has_unistring) so_execute_init_array(&so_unistring);
   so_execute_init_array(&so_main);
 
   // Free temp ELF images
-  debugPrintf("Freeing temp images...\n");
+  printf("Freeing temp images...\n");
   if (has_sndfile) so_free_temp(&so_sndfile);
   if (has_unistring) so_free_temp(&so_unistring);
   so_free_temp(&so_main);
 
-  debugPrintf("Starting SDL_main at %p...\n", SDL_main_func);
+  printf("Starting SDL_main at %p...\n", SDL_main_func);
 
   // Determine basepath: if assets are in /switch/rvgl/assets, point to that
   struct stat st;
@@ -368,16 +323,16 @@ int main(int argc, char *argv[]) {
   };
   int game_argc = 8;
 
-  debugPrintf("Running with basepath: %s\n", basepath);
+  printf("Running with basepath: %s\n", basepath);
 
   int ret = SDL_main_func(game_argc, game_argv);
-  debugPrintf("SDL_main returned %d\n", ret);
+  printf("SDL_main returned %d\n", ret);
 
   deinit_openal();
   deinit_opengl();
   unpatch_game();
 
-  debugPrintf("Unloading modules...\n");
+  printf("Unloading modules...\n");
   so_unload(&so_main);
   if (has_unistring) so_unload(&so_unistring);
   if (has_sndfile) so_unload(&so_sndfile);

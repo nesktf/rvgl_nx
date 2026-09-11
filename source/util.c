@@ -7,17 +7,15 @@
  */
 
 #include <switch.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <stdarg.h>
-#include <string.h>
 #include <unistd.h>
 
 #include "util.h"
-#include "config.h"
 
-#define DEBUG_LOG
 #ifdef DEBUG_LOG
+#include <stdio.h>
+#include <string.h>
+#include "config.h"
 
 static int s_nxlinkSock = -1;
 
