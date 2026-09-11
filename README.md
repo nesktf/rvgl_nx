@@ -23,6 +23,7 @@ User made content should work just fine, but I haven't tested anything outside o
 
 ### Building
 Install devkitA64 and the following libraries:
+
 - `switch-mesa`
 - `switch-mpg123`
 - `switch-openal-soft`
