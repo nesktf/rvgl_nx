@@ -37,11 +37,18 @@ static void deinitNxLink(void) {
   }
 }
 
+static FILE *s_logFile = NULL;
+
 void userAppInit(void) {
   initNxLink();
+  s_logFile = fopen(LOG_NAME, "w");
 }
 
 void userAppExit(void) {
+  if (s_logFile) {
+    fclose(s_logFile);
+    s_logFile = NULL;
+  }
   deinitNxLink();
 }
 
@@ -51,12 +58,11 @@ int debugPrintf(char *text, ...) {
 #ifdef DEBUG_LOG
   va_list list;
 
-  FILE *f = fopen(LOG_NAME, "a");
-  if (f) {
+  if (s_logFile) {
     va_start(list, text);
-    vfprintf(f, text, list);
+    vfprintf(s_logFile, text, list);
     va_end(list);
-    fclose(f);
+    fflush(s_logFile);
   }
 
   va_start(list, text);

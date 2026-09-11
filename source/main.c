@@ -79,23 +79,61 @@ static void check_syscalls(void) {
     fatal_error("Own process handle is unavailable.");
 }
 
+static void read_ini_resolution(const char *path, int *w, int *h) {
+  FILE *f = fopen(path, "r");
+  if (!f) return;
+  char line[256];
+  while (fgets(line, sizeof(line), f)) {
+    int val = 0;
+    if (sscanf(line, " ScreenWidth = %d", &val) == 1 || sscanf(line, "ScreenWidth = %d", &val) == 1) {
+      if (val > 0) *w = val;
+    } else if (sscanf(line, " ScreenHeight = %d", &val) == 1 || sscanf(line, "ScreenHeight = %d", &val) == 1) {
+      if (val > 0) *h = val;
+    }
+  }
+  fclose(f);
+}
+
 static void set_screen_size(int w, int h) {
-  if (w <= 0 || h <= 0 || w > 1920 || h > 1080) {
-    if (appletGetOperationMode() == AppletOperationMode_Console) {
-      screen_width = 1920;
-      screen_height = 1080;
-    } else {
+  bool is_docked = (appletGetOperationMode() == AppletOperationMode_Console);
+
+  // Check user-configured ScreenWidth / ScreenHeight from profiles/rvgl.ini or rvgl.ini
+  int ini_w = 0, ini_h = 0;
+  read_ini_resolution("/switch/rvgl/profiles/rvgl.ini", &ini_w, &ini_h);
+  if (ini_w <= 0 || ini_h <= 0) {
+    read_ini_resolution("/switch/rvgl/rvgl.ini", &ini_w, &ini_h);
+  }
+
+  int target_w = (w > 0) ? w : ini_w;
+  int target_h = (h > 0) ? h : ini_h;
+
+  if (target_h == 480) {
+    // 480p
+    screen_width = (target_w > 0 && target_w <= 854) ? target_w : 854;
+    screen_height = 480;
+  } else if (!is_docked) {
+    // In Handheld mode: native 720p
+    screen_width = 1280;
+    screen_height = 720;
+  } else {
+    // In Docked mode:
+    if (target_h == 720) {
       screen_width = 1280;
       screen_height = 720;
+    } else {
+      screen_width = 1920;
+      screen_height = 1080;
     }
-  } else {
-    screen_width = w;
-    screen_height = h;
   }
-  debugPrintf("screen mode: %dx%d\n", screen_width, screen_height);
+
+  debugPrintf("Switch mode: %s, Selected rendering resolution: %dx%d\n",
+              is_docked ? "Docked" : "Handheld",
+              screen_width, screen_height);
 }
 
 static void write_rvgl_ini(const char *path) {
+  int default_w = (appletGetOperationMode() == AppletOperationMode_Console) ? 1920 : 1280;
+  int default_h = (appletGetOperationMode() == AppletOperationMode_Console) ? 1080 : 720;
   FILE *f = fopen(path, "w");
   if (f) {
     fprintf(f,
@@ -103,8 +141,8 @@ static void write_rvgl_ini(const char *path) {
       "Language = 3\n"
       "\n"
       "[Video]\n"
-      "ScreenWidth = 1280\n"
-      "ScreenHeight = 720\n"
+      "ScreenWidth = %d\n"
+      "ScreenHeight = %d\n"
       "Shaders = 1\n"
       "Threaded = 0\n"
       "\n"
@@ -116,7 +154,8 @@ static void write_rvgl_ini(const char *path) {
       "SampleRate = 48000\n"
       "\n"
       "[Misc]\n"
-      "DemoTimeout = 0\n"
+      "DemoTimeout = 0\n",
+      default_w, default_h
     );
     fclose(f);
     debugPrintf("Wrote config to %s\n", path);
@@ -256,15 +295,23 @@ int main(int argc, char *argv[]) {
     basepath = "/switch/rvgl/assets";
   }
 
+  char str_w[16], str_h[16];
+  snprintf(str_w, sizeof(str_w), "%d", screen_width);
+  snprintf(str_h, sizeof(str_h), "%d", screen_height);
+
   char *game_argv[] = {
     "rvgl",
     "-basepath",
     (char *)basepath,
     "-prefpath",
     "/switch/rvgl",
+    "-res",
+    str_w,
+    str_h,
+    "32",
     NULL
   };
-  int game_argc = 5;
+  int game_argc = 8;
 
   debugPrintf("Running with basepath: %s\n", basepath);
 

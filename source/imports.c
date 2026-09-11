@@ -90,8 +90,15 @@ static int SDL_AndroidRequestPermission_fake(const char *permission) {
   return 1;
 }
 
+extern int screen_width;
+extern int screen_height;
+
 static SDL_Window *SDL_CreateWindow_hook(const char *title, int x, int y, int w, int h, Uint32 flags) {
-  debugPrintf("SDL_CreateWindow: title='%s', %dx%d, flags=0x%08x\n", title, w, h, flags);
+  if (w <= 0 || h <= 0) {
+    w = screen_width;
+    h = screen_height;
+  }
+  debugPrintf("SDL_CreateWindow: title='%s', requested=%dx%d, flags=0x%08x\n", title, w, h, flags);
   flags |= SDL_WINDOW_OPENGL;
   SDL_Window *win = SDL_CreateWindow(title, x, y, w, h, flags);
   debugPrintf("SDL_CreateWindow -> %p (error: %s)\n", win, SDL_GetError());
@@ -152,46 +159,13 @@ static void *alcGetProcAddress_hook(ALCdevice *dev, const ALCchar *funcname) {
   return res;
 }
 
-static void alSourcePlay_hook(ALuint source) {
-  debugPrintf("alSourcePlay(source=%u)\n", source);
-  alSourcePlay(source);
+static int SDL_GL_SetSwapInterval_hook(int interval) {
+  debugPrintf("SDL_GL_SetSwapInterval(%d)\n", interval);
+  int res = SDL_GL_SetSwapInterval(interval);
+  debugPrintf("SDL_GL_SetSwapInterval returned %d (error: %s)\n", res, SDL_GetError());
+  return res;
 }
 
-static void alSourcef_hook(ALuint source, ALenum param, ALfloat value) {
-  if (param == AL_GAIN) {
-    debugPrintf("alSourcef(source=%u, AL_GAIN, %f)\n", source, value);
-  }
-  alSourcef(source, param, value);
-}
-
-static void alBufferData_hook(ALuint buffer, ALenum format, const ALvoid *data, ALsizei size, ALsizei freq) {
-  alBufferData(buffer, format, data, size, freq);
-  ALenum err = alGetError();
-  if (err != AL_NO_ERROR) {
-    debugPrintf("alBufferData(buf=%u, fmt=0x%x, size=%d, freq=%d) ERROR 0x%x\n", buffer, format, size, freq, err);
-  }
-}
-
-static void alSourceQueueBuffers_hook(ALuint source, ALsizei nb, const ALuint *buffers) {
-  alSourceQueueBuffers(source, nb, buffers);
-  ALenum err = alGetError();
-  if (err != AL_NO_ERROR) {
-    debugPrintf("alSourceQueueBuffers(source=%u, nb=%d, buf0=%u) ERROR 0x%x\n", source, nb, nb > 0 && buffers ? buffers[0] : 0, err);
-  } else {
-    static int qcount = 0;
-    if ((++qcount % 20) == 1) {
-      debugPrintf("alSourceQueueBuffers(source=%u, nb=%d, buf0=%u) OK (count=%d)\n", source, nb, nb > 0 && buffers ? buffers[0] : 0, qcount);
-    }
-  }
-}
-
-static void alSourceUnqueueBuffers_hook(ALuint source, ALsizei nb, ALuint *buffers) {
-  alSourceUnqueueBuffers(source, nb, buffers);
-  ALenum err = alGetError();
-  if (err != AL_NO_ERROR) {
-    debugPrintf("alSourceUnqueueBuffers(source=%u, nb=%d) ERROR 0x%x\n", source, nb, err);
-  }
-}
 
 static int dl_iterate_phdr_fake(int (*callback)(void *info, size_t size, void *data), void *data) {
   return so_dl_iterate_phdr(callback, data);
@@ -216,9 +190,11 @@ static ssize_t writev_fake(int fd, const struct bionic_iovec *iov, int iovcnt) {
 int pthread_mutex_init_fake(pthread_mutex_t **uid, const int *mutexattr) {
   pthread_mutex_t *m = calloc(1, sizeof(pthread_mutex_t));
   if (!m) return -1;
-  const int recursive = (mutexattr && *mutexattr == 1);
-  *m = recursive ? PTHREAD_RECURSIVE_MUTEX_INITIALIZER : PTHREAD_MUTEX_INITIALIZER;
-  int ret = pthread_mutex_init(m, NULL);
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+  int ret = pthread_mutex_init(m, &attr);
+  pthread_mutexattr_destroy(&attr);
   if (ret < 0) {
     free(m);
     return -1;
@@ -237,26 +213,36 @@ int pthread_mutex_destroy_fake(pthread_mutex_t **uid) {
 }
 
 int pthread_mutex_lock_fake(pthread_mutex_t **uid) {
-  int ret = 0;
-  if (!*uid) {
-    ret = pthread_mutex_init_fake(uid, NULL);
-  } else if ((uintptr_t)*uid == 0x4000) {
-    int attr = 1;
-    ret = pthread_mutex_init_fake(uid, &attr);
+  if (!uid) return -1;
+  if (!*uid || (uintptr_t)*uid <= 0x8000) {
+    pthread_mutex_t *m = NULL;
+    pthread_mutex_init_fake(&m, NULL);
+    if (!__sync_bool_compare_and_swap(uid, 0, m)) {
+      if ((uintptr_t)*uid <= 0x8000) {
+        *uid = m;
+      } else {
+        pthread_mutex_destroy(m);
+        free(m);
+      }
+    }
   }
-  if (ret < 0) return ret;
   return pthread_mutex_lock(*uid);
 }
 
 int pthread_mutex_unlock_fake(pthread_mutex_t **uid) {
-  int ret = 0;
-  if (!*uid) {
-    ret = pthread_mutex_init_fake(uid, NULL);
-  } else if ((uintptr_t)*uid == 0x4000) {
-    int attr = 1;
-    ret = pthread_mutex_init_fake(uid, &attr);
+  if (!uid) return -1;
+  if (!*uid || (uintptr_t)*uid <= 0x8000) {
+    pthread_mutex_t *m = NULL;
+    pthread_mutex_init_fake(&m, NULL);
+    if (!__sync_bool_compare_and_swap(uid, 0, m)) {
+      if ((uintptr_t)*uid <= 0x8000) {
+        *uid = m;
+      } else {
+        pthread_mutex_destroy(m);
+        free(m);
+      }
+    }
   }
-  if (ret < 0) return ret;
   return pthread_mutex_unlock(*uid);
 }
 
@@ -481,6 +467,13 @@ int pthread_create_fake(pthread_t *thread, const void *unused, void *entry, void
   return res;
 }
 
+static int pthread_join_hook(pthread_t thread, void **retval) {
+  debugPrintf("pthread_join(thread=%p) called\n", (void *)thread);
+  int res = pthread_join(thread, retval);
+  debugPrintf("pthread_join(thread=%p) returned %d\n", (void *)thread, res);
+  return res;
+}
+
 typedef struct {
   int (*fn)(void *);
   void *data;
@@ -511,10 +504,21 @@ static SDL_Thread *SDL_CreateThread_hook(SDL_ThreadFunction fn, const char *name
 }
 
 static uint32_t s_swapCount = 0;
+static uint64_t s_lastFpsTime = 0;
+static uint32_t s_fpsFrames = 0;
+
 static void SDL_GL_SwapWindow_hook(SDL_Window *window) {
   s_swapCount++;
-  if ((s_swapCount % 300) == 0) {
-    debugPrintf("[Heartbeat] SDL_GL_SwapWindow frame %u\n", s_swapCount);
+  s_fpsFrames++;
+  uint64_t now = armGetSystemTick();
+  uint64_t freq = armGetSystemTickFreq();
+  if (s_lastFpsTime == 0) {
+    s_lastFpsTime = now;
+  } else if (now - s_lastFpsTime >= freq) {
+    float fps = (float)s_fpsFrames * freq / (float)(now - s_lastFpsTime);
+    debugPrintf("[FPS] %.1f fps (frame %u, res %dx%d)\n", fps, s_swapCount, screen_width, screen_height);
+    s_fpsFrames = 0;
+    s_lastFpsTime = now;
   }
   SDL_GL_SwapWindow(window);
 }
@@ -548,7 +552,7 @@ DynLibFunction dynlib_functions[] = {
   { "SDL_GL_MakeCurrent", (uintptr_t)&SDL_GL_MakeCurrent },
   { "SDL_GL_ResetAttributes", (uintptr_t)&SDL_GL_ResetAttributes },
   { "SDL_GL_SetAttribute", (uintptr_t)&SDL_GL_SetAttribute },
-  { "SDL_GL_SetSwapInterval", (uintptr_t)&SDL_GL_SetSwapInterval },
+  { "SDL_GL_SetSwapInterval", (uintptr_t)&SDL_GL_SetSwapInterval_hook },
   { "SDL_GL_SwapWindow", (uintptr_t)&SDL_GL_SwapWindow_hook },
   { "SDL_GameControllerAddMappingsFromRW", (uintptr_t)&SDL_GameControllerAddMappingsFromRW },
   { "SDL_GameControllerClose", (uintptr_t)&SDL_GameControllerClose },
@@ -648,7 +652,7 @@ DynLibFunction dynlib_functions[] = {
   { "accept", (uintptr_t)&accept },
   { "access", (uintptr_t)&access },
   { "acos", (uintptr_t)&acos },
-  { "alBufferData", (uintptr_t)&alBufferData_hook },
+  { "alBufferData", (uintptr_t)&alBufferData },
   { "alDeleteBuffers", (uintptr_t)&alDeleteBuffers },
   { "alDeleteSources", (uintptr_t)&alDeleteSources },
   { "alDistanceModel", (uintptr_t)&alDistanceModel },
@@ -663,11 +667,11 @@ DynLibFunction dynlib_functions[] = {
   { "alIsSource", (uintptr_t)&alIsSource },
   { "alSource3f", (uintptr_t)&alSource3f },
   { "alSourcePause", (uintptr_t)&alSourcePause },
-  { "alSourcePlay", (uintptr_t)&alSourcePlay_hook },
-  { "alSourceQueueBuffers", (uintptr_t)&alSourceQueueBuffers_hook },
+  { "alSourcePlay", (uintptr_t)&alSourcePlay },
+  { "alSourceQueueBuffers", (uintptr_t)&alSourceQueueBuffers },
   { "alSourceStop", (uintptr_t)&alSourceStop },
-  { "alSourceUnqueueBuffers", (uintptr_t)&alSourceUnqueueBuffers_hook },
-  { "alSourcef", (uintptr_t)&alSourcef_hook },
+  { "alSourceUnqueueBuffers", (uintptr_t)&alSourceUnqueueBuffers },
+  { "alSourcef", (uintptr_t)&alSourcef },
   { "alSourcei", (uintptr_t)&alSourcei },
   { "alcCloseDevice", (uintptr_t)&alcCloseDevice },
   { "alcCreateContext", (uintptr_t)&alcCreateContextHook },
@@ -778,7 +782,7 @@ DynLibFunction dynlib_functions[] = {
   { "printf", (uintptr_t)&debugPrintf },
   { "pthread_create", (uintptr_t)&pthread_create_fake },
   { "pthread_getspecific", (uintptr_t)&pthread_getspecific },
-  { "pthread_join", (uintptr_t)&pthread_join },
+  { "pthread_join", (uintptr_t)&pthread_join_hook },
   { "pthread_key_create", (uintptr_t)&pthread_key_create },
   { "pthread_key_delete", (uintptr_t)&pthread_key_delete },
   { "pthread_mutex_destroy", (uintptr_t)&pthread_mutex_destroy_fake },
