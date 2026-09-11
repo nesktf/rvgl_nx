@@ -1,1 +1,5 @@
 res/
+build/
+*.elf
+*.nacp
+*.nro
