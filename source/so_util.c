@@ -473,6 +473,8 @@ int so_unload(so_module *mod) {
   if (mod->load_base == NULL)
     return -1;
 
+  debugPrintf("%s: so_unload starting\n", mod->name);
+
   if (mod->so_base) {
     // free the temp image if still present
     so_free_temp(mod);
@@ -485,10 +487,15 @@ int so_unload(so_module *mod) {
       continue;
     const u64 seg_start = ((u64)mod->load_virtbase + p->p_vaddr) & ~0xFFFull;
     const u64 seg_end = ALIGN_MEM((u64)mod->load_virtbase + p->p_vaddr + p->p_memsz, 0x1000);
-    svcSetProcessMemoryPermission(envGetOwnProcessHandle(), seg_start, seg_end - seg_start, Perm_Rw);
+    Result rc = svcSetProcessMemoryPermission(envGetOwnProcessHandle(), seg_start, seg_end - seg_start, Perm_Rw);
+    debugPrintf("%s: remap %p (size 0x%lx) to RW -> 0x%08x\n",
+                mod->name, (void *)seg_start, (unsigned long)(seg_end - seg_start), rc);
   }
+
   // unmap everything
-  svcUnmapProcessCodeMemory(envGetOwnProcessHandle(), (u64)mod->load_virtbase, (u64)mod->load_base, mod->load_size);
+  Result rc = svcUnmapProcessCodeMemory(envGetOwnProcessHandle(), (u64)mod->load_virtbase, (u64)mod->load_base, mod->load_size);
+  debugPrintf("%s: svcUnmapProcessCodeMemory(virt=%p, base=%p, size=0x%lx) -> 0x%08x\n",
+              mod->name, mod->load_virtbase, mod->load_base, (unsigned long)mod->load_size, rc);
 
   // release virtual address range
   virtmemLock();
@@ -506,6 +513,10 @@ int so_unload(so_module *mod) {
       }
     }
   }
+
+  mod->load_base = NULL;
+  mod->load_virtbase = NULL;
+  debugPrintf("%s: so_unload done\n", mod->name);
 
   return 0;
 }

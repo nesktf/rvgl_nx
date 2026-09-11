@@ -51,8 +51,8 @@
 #include "util.h"
 #include "libc_shim.h"
 #include "imports.h"
+#include "hooks.h"
 
-extern uintptr_t __cxa_atexit;
 extern uintptr_t __stack_chk_fail;
 
 static char *__ctype_ = (char *)&_ctype_;
@@ -126,8 +126,8 @@ static char *SDL_GetPrefPath_hook(const char *org, const char *app) {
 }
 
 // OpenAL hooks
-static ALCcontext *al_ctx = NULL;
-static ALCdevice *al_dev = NULL;
+ALCcontext *al_ctx = NULL;
+ALCdevice *al_dev = NULL;
 
 static ALCcontext *alcCreateContextHook(ALCdevice *dev, const ALCint *attrList) {
   debugPrintf("alcCreateContextHook(dev=%p, attrList=%p)\n", dev, attrList);
@@ -309,32 +309,8 @@ static FILE *freopen_hook(const char *path, const char *mode, FILE *stream) {
   return freopen(path, mode, stream);
 }
 
-#define INPUT_QUEUE_SIZE 256
-static char s_inputQueue[INPUT_QUEUE_SIZE];
-static int s_inputHead = 0;
-static int s_inputTail = 0;
-static bool s_textInputActive = false;
-static bool s_charSentThisFrame = false;
+bool s_textInputActive = false;
 bool s_inSwkbd = false;
-
-static void queue_input_char(char c) {
-  int next = (s_inputTail + 1) % INPUT_QUEUE_SIZE;
-  if (next != s_inputHead) {
-    s_inputQueue[s_inputTail] = c;
-    s_inputTail = next;
-  }
-}
-
-static void queue_input_string(const char *str) {
-  // First, send 16 backspaces to delete any existing/default text in the input box
-  for (int i = 0; i < 16; i++) {
-    queue_input_char('\b');
-  }
-  // Then queue each character of the string
-  while (*str) {
-    queue_input_char(*str++);
-  }
-}
 
 static void trigger_swkbd(void) {
   if (s_inSwkbd) return;
@@ -350,60 +326,51 @@ static void trigger_swkbd(void) {
     swkbdClose(&kbd);
     if (R_SUCCEEDED(rc) && out_text[0] != '\0') {
       debugPrintf("swkbd returned: '%s'\n", out_text);
-      queue_input_string(out_text);
+      apply_text_input(out_text);
     }
   }
 
-  // Flush all input events that arrived while the swkbd overlay was showing
-  SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+  // Drain any lingering button presses (especially button A from clicking OK in swkbd)
+  // so they do not leak into RVGL and trigger accidental "Connect" or menu advance.
+  Uint32 flush_start = SDL_GetTicks();
+  while (SDL_GetTicks() - flush_start < 250) {
+    SDL_PumpEvents();
+    SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+    svcSleepThread(10000000ULL); // 10ms
+  }
+
+  touch_text_field();
   s_inSwkbd = false;
 }
 
 static void SDL_StartTextInput_hook(void) {
   debugPrintf("SDL_StartTextInput_hook called\n");
   s_textInputActive = true;
-  // Do NOT open swkbd automatically; wait for user to press (X) or tap the screen
+  // Do NOT open swkbd automatically; wait for user to press (X) or (Y)
 }
 
 static void SDL_StopTextInput_hook(void) {
   debugPrintf("SDL_StopTextInput_hook called\n");
   s_textInputActive = false;
-  s_inputHead = 0;
-  s_inputTail = 0;
   SDL_StopTextInput();
 }
 
 static int SDL_PollEvent_hook(SDL_Event *event) {
-  // If we have characters queued, feed ONE character per frame
-  if (!s_charSentThisFrame && s_inputHead != s_inputTail) {
-    char c = s_inputQueue[s_inputHead];
-    s_inputHead = (s_inputHead + 1) % INPUT_QUEUE_SIZE;
-    s_charSentThisFrame = true;
-
-    if (event) {
-      memset(event, 0, sizeof(*event));
-      event->type = SDL_TEXTINPUT;
-      event->text.type = SDL_TEXTINPUT;
-      event->text.text[0] = c;
-      event->text.text[1] = '\0';
-    }
-    return 1;
+  // If the text field has stopped being drawn (user left text input screen),
+  // immediately deactivate text input mode.
+  if (s_textInputActive && !is_text_field_active()) {
+    s_textInputActive = false;
   }
 
   int ret = SDL_PollEvent(event);
   if (ret) {
     if (event) {
-      // If text input is active and user presses (X) or taps screen, open swkbd on demand:
-      if (s_textInputActive && !s_inSwkbd) {
-        bool open_kbd = false;
-        if (event->type == SDL_CONTROLLERBUTTONDOWN && event->cbutton.button == SDL_CONTROLLER_BUTTON_X)
-          open_kbd = true;
-        else if (event->type == SDL_JOYBUTTONDOWN && event->jbutton.button == 2)
-          open_kbd = true;
-        else if (event->type == SDL_FINGERDOWN || event->type == SDL_MOUSEBUTTONDOWN)
-          open_kbd = true;
-
-        if (open_kbd) {
+      // If text input is active AND the text field is currently visible on screen,
+      // and user presses (X) or (Y) on controller, open swkbd on demand:
+      // In SDL2 on Switch: BUTTON_X is West button (Switch Y), BUTTON_Y is North button (Switch X).
+      if (s_textInputActive && is_text_field_active() && !s_inSwkbd) {
+        if (event->type == SDL_CONTROLLERBUTTONDOWN &&
+            (event->cbutton.button == SDL_CONTROLLER_BUTTON_X || event->cbutton.button == SDL_CONTROLLER_BUTTON_Y)) {
           trigger_swkbd();
           memset(event, 0, sizeof(*event));
           return SDL_PollEvent(event);
@@ -431,8 +398,6 @@ static int SDL_PollEvent_hook(SDL_Event *event) {
     return 1;
   }
 
-  // Frame finished draining events
-  s_charSentThisFrame = false;
   return 0;
 }
 
@@ -667,7 +632,7 @@ DynLibFunction dynlib_functions[] = {
   { "SDL_free", (uintptr_t)&SDL_free },
   { "SDL_setenv", (uintptr_t)&SDL_setenv },
   { "__ctype_get_mb_cur_max", (uintptr_t)&__ctype_get_mb_cur_max_fake },
-  { "__cxa_atexit", (uintptr_t)&__cxa_atexit },
+  { "__cxa_atexit", (uintptr_t)&ret0 },
   { "__cxa_finalize", (uintptr_t)&ret0 },
   { "__errno", (uintptr_t)&__errno_hook },
   { "__google_potentially_blocking_region_begin", (uintptr_t)&ret0 },
@@ -722,13 +687,13 @@ DynLibFunction dynlib_functions[] = {
   { "atan2", (uintptr_t)&atan2 },
   { "atof", (uintptr_t)&atof },
   { "atol", (uintptr_t)&atol },
-  { "bind", (uintptr_t)&bind },
+  { "bind", (uintptr_t)&bind_fake },
   { "btowc", (uintptr_t)&btowc },
   { "calloc", (uintptr_t)&calloc },
   { "chdir", (uintptr_t)&chdir },
   { "close", (uintptr_t)&close },
   { "closedir", (uintptr_t)&closedir },
-  { "connect", (uintptr_t)&connect },
+  { "connect", (uintptr_t)&connect_fake },
   { "cos", (uintptr_t)&cos },
   { "dl_iterate_phdr", (uintptr_t)&dl_iterate_phdr_fake },
   { "fclose", (uintptr_t)&fclose },
@@ -766,7 +731,7 @@ DynLibFunction dynlib_functions[] = {
   { "getc_unlocked", (uintptr_t)&getc_unlocked },
   { "getenv", (uintptr_t)&getenv },
   { "getnameinfo", (uintptr_t)&getnameinfo },
-  { "getsockname", (uintptr_t)&getsockname },
+  { "getsockname", (uintptr_t)&getsockname_fake },
   { "getsockopt", (uintptr_t)&getsockopt_fake },
   { "gettimeofday", (uintptr_t)&gettimeofday },
   { "getwc", (uintptr_t)&getwc },

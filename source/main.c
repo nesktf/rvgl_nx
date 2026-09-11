@@ -61,6 +61,45 @@ void __libnx_initheap(void) {
 }
 
 
+#include <dirent.h>
+
+static void dump_latest_crash_report(void) {
+  DIR *d = opendir("/atmosphere/crash_reports");
+  if (!d) d = opendir("sdmc:/atmosphere/crash_reports");
+  if (!d) return;
+
+  struct dirent *ent;
+  char latest_file[512] = {0};
+  time_t latest_mtime = 0;
+
+  while ((ent = readdir(d))) {
+    if (ent->d_name[0] == '.') continue;
+    char path[512];
+    snprintf(path, sizeof(path), "/atmosphere/crash_reports/%s", ent->d_name);
+    struct stat st;
+    if (stat(path, &st) == 0) {
+      if (st.st_mtime > latest_mtime) {
+        latest_mtime = st.st_mtime;
+        snprintf(latest_file, sizeof(latest_file), "%s", path);
+      }
+    }
+  }
+  closedir(d);
+
+  if (latest_file[0] != '\0') {
+    debugPrintf("[CrashReport] Latest Atmosphere crash report: %s\n", latest_file);
+    FILE *f = fopen(latest_file, "r");
+    if (f) {
+      char line[256];
+      int count = 0;
+      while (fgets(line, sizeof(line), f) && count++ < 35) {
+        debugPrintf("[CrashDump] %s", line);
+      }
+      fclose(f);
+    }
+  }
+}
+
 static void check_data(void) {
   struct stat st;
   if (stat(SO_NAME, &st) < 0) {
@@ -213,6 +252,8 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  dump_latest_crash_report();
+
   check_syscalls();
   check_data();
 
@@ -331,6 +372,15 @@ int main(int argc, char *argv[]) {
 
   int ret = SDL_main_func(game_argc, game_argv);
   debugPrintf("SDL_main returned %d\n", ret);
+
+  deinit_openal();
+  deinit_opengl();
+  unpatch_game();
+
+  debugPrintf("Unloading modules...\n");
+  so_unload(&so_main);
+  if (has_unistring) so_unload(&so_unistring);
+  if (has_sndfile) so_unload(&so_sndfile);
 
   return ret;
 }

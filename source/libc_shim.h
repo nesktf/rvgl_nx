@@ -151,6 +151,11 @@ int sem_unlink_fake(const char *name);
 // fcntl with bionic O_NONBLOCK flag translation for the netcode's F_SETFL
 int fcntl_fake(int fd, int cmd, ...);
 
+// socket shims with bionic<->BSD sockaddr translation
+int bind_fake(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+int connect_fake(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+int getsockname_fake(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+
 // setsockopt with bionic->libnx level/optname constant translation
 int setsockopt_fake(int fd, int level, int optname, const void *optval, uint32_t optlen);
 int getsockopt_fake(int fd, int level, int optname, void *optval, socklen_t *optlen);

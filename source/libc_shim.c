@@ -30,6 +30,8 @@
 #include <sys/stat.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <switch.h>
 
 #include "config.h"
@@ -339,7 +341,16 @@ int setsockopt_fake(int fd, int level, int optname, const void *optval, uint32_t
       default:     break; // pass unknown optnames through unchanged
     }
   }
-  return setsockopt(fd, lv, on, optval, (socklen_t)optlen);
+  int ret = setsockopt(fd, lv, on, optval, (socklen_t)optlen);
+  if (ret < 0 && lv == SOL_SOCKET && (on == SO_RCVBUF || on == SO_SNDBUF)) {
+    int clamped = 65536;
+    ret = setsockopt(fd, lv, on, &clamped, sizeof(clamped));
+    if (ret < 0) {
+      clamped = 32768;
+      ret = setsockopt(fd, lv, on, &clamped, sizeof(clamped));
+    }
+  }
+  return ret;
 }
 
 int getsockopt_fake(int fd, int level, int optname, void *optval, socklen_t *optlen) {
@@ -372,6 +383,62 @@ int getsockopt_fake(int fd, int level, int optname, void *optval, socklen_t *opt
   return ret;
 }
 
+static void sockaddr_bionic_to_nx(const struct sockaddr *src, struct sockaddr_storage *dst, socklen_t *addrlen) {
+  if (!src || !dst || !addrlen || *addrlen == 0) return;
+  socklen_t len = *addrlen;
+  if (len > sizeof(struct sockaddr_storage)) len = sizeof(struct sockaddr_storage);
+  memcpy(dst, src, len);
+  if (len >= 2) {
+    uint8_t family = ((const uint8_t *)src)[0];
+    ((uint8_t *)dst)[0] = (uint8_t)len;
+    ((uint8_t *)dst)[1] = family;
+  }
+  *addrlen = len;
+}
+
+static void sockaddr_nx_to_bionic(const struct sockaddr *src, struct sockaddr *dst, socklen_t *addrlen) {
+  if (!src || !dst || !addrlen || *addrlen == 0) return;
+  socklen_t len = *addrlen;
+  if (len > sizeof(struct sockaddr_storage)) len = sizeof(struct sockaddr_storage);
+  memcpy(dst, src, len);
+  if (len >= 2) {
+    uint8_t family = ((const uint8_t *)src)[1];
+    ((uint8_t *)dst)[0] = family;
+    ((uint8_t *)dst)[1] = 0;
+  }
+}
+
+int bind_fake(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+  if (!addr || addrlen == 0) return bind(sockfd, addr, addrlen);
+  struct sockaddr_storage nx_addr;
+  sockaddr_bionic_to_nx(addr, &nx_addr, &addrlen);
+  int ret = bind(sockfd, (struct sockaddr *)&nx_addr, addrlen);
+  debugPrintf("[Network] bind(fd=%d, len=%d, port=%d) -> %d (errno=%d)\n",
+              sockfd, addrlen, ntohs(((struct sockaddr_in *)&nx_addr)->sin_port), ret, errno);
+  return ret;
+}
+
+int connect_fake(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+  if (!addr || addrlen == 0) return connect(sockfd, addr, addrlen);
+  struct sockaddr_storage nx_addr;
+  sockaddr_bionic_to_nx(addr, &nx_addr, &addrlen);
+  int ret = connect(sockfd, (struct sockaddr *)&nx_addr, addrlen);
+  debugPrintf("[Network] connect(fd=%d, len=%d, port=%d) -> %d (errno=%d)\n",
+              sockfd, addrlen, ntohs(((struct sockaddr_in *)&nx_addr)->sin_port), ret, errno);
+  return ret;
+}
+
+int getsockname_fake(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+  if (!addr || !addrlen || *addrlen == 0) return getsockname(sockfd, addr, addrlen);
+  struct sockaddr_storage nx_addr;
+  socklen_t nx_len = sizeof(nx_addr);
+  int ret = getsockname(sockfd, (struct sockaddr *)&nx_addr, &nx_len);
+  if (ret == 0) {
+    sockaddr_nx_to_bionic((struct sockaddr *)&nx_addr, addr, addrlen);
+  }
+  return ret;
+}
+
 struct bionic_msghdr {
   void *msg_name;
   socklen_t msg_namelen;
@@ -386,21 +453,22 @@ struct bionic_msghdr {
 
 static int translate_msg_flags_to_nx(int flags) {
   int out = 0;
-  if (flags & 0x01)   out |= MSG_OOB;
-  if (flags & 0x02)   out |= MSG_PEEK;
-  if (flags & 0x04)   out |= MSG_DONTROUTE;
-  if (flags & 0x40)   out |= MSG_WAITALL;
-  if (flags & 0x80)   out |= MSG_DONTWAIT;
-  if (flags & 0x4000) out |= MSG_NOSIGNAL; // Linux MSG_NOSIGNAL (0x4000) -> libnx MSG_NOSIGNAL (0x20000)
+  if (flags & 0x01)   out |= MSG_OOB;       // Linux MSG_OOB (1) -> libnx MSG_OOB (1)
+  if (flags & 0x02)   out |= MSG_PEEK;      // Linux MSG_PEEK (2) -> libnx MSG_PEEK (2)
+  if (flags & 0x04)   out |= MSG_DONTROUTE; // Linux MSG_DONTROUTE (4) -> libnx MSG_DONTROUTE (4)
+  if (flags & 0x40)   out |= MSG_DONTWAIT;  // Linux MSG_DONTWAIT (0x40) -> libnx MSG_DONTWAIT (0x80)
+  if (flags & 0x80)   out |= MSG_EOR;       // Linux MSG_EOR (0x80) -> libnx MSG_EOR (0x08)
+  if (flags & 0x100)  out |= MSG_WAITALL;   // Linux MSG_WAITALL (0x100) -> libnx MSG_WAITALL (0x40)
+  if (flags & 0x4000) out |= MSG_NOSIGNAL;  // Linux MSG_NOSIGNAL (0x4000) -> libnx MSG_NOSIGNAL (0x20000)
   return out;
 }
 
 static int translate_msg_flags_to_bionic(int flags) {
   int out = 0;
-  if (flags & MSG_OOB)     out |= 0x01;
-  if (flags & MSG_EOR)     out |= 0x08;
-  if (flags & MSG_TRUNC)   out |= 0x20; // Linux MSG_TRUNC = 0x20
-  if (flags & MSG_CTRUNC)  out |= 0x08;
+  if (flags & MSG_OOB)      out |= 0x01; // Linux MSG_OOB = 1
+  if (flags & MSG_EOR)      out |= 0x80; // Linux MSG_EOR = 0x80
+  if (flags & MSG_TRUNC)    out |= 0x20; // libnx MSG_TRUNC (0x10) -> Linux MSG_TRUNC (0x20)
+  if (flags & MSG_CTRUNC)   out |= 0x08; // libnx MSG_CTRUNC (0x20) -> Linux MSG_CTRUNC (0x08)
   return out;
 }
 
@@ -409,8 +477,13 @@ ssize_t sendmsg_fake(int sockfd, const struct bionic_msghdr *bmsg, int flags) {
 
   struct msghdr nx_msg;
   memset(&nx_msg, 0, sizeof(nx_msg));
-  nx_msg.msg_name = bmsg->msg_name;
-  nx_msg.msg_namelen = bmsg->msg_namelen;
+  struct sockaddr_storage nx_addr;
+  if (bmsg->msg_name && bmsg->msg_namelen > 0) {
+    socklen_t len = bmsg->msg_namelen;
+    sockaddr_bionic_to_nx((const struct sockaddr *)bmsg->msg_name, &nx_addr, &len);
+    nx_msg.msg_name = &nx_addr;
+    nx_msg.msg_namelen = len;
+  }
   nx_msg.msg_iov = (struct iovec *)bmsg->msg_iov;
   nx_msg.msg_iovlen = (int)bmsg->msg_iovlen;
   nx_msg.msg_control = bmsg->msg_control;
@@ -426,8 +499,11 @@ ssize_t recvmsg_fake(int sockfd, struct bionic_msghdr *bmsg, int flags) {
 
   struct msghdr nx_msg;
   memset(&nx_msg, 0, sizeof(nx_msg));
-  nx_msg.msg_name = bmsg->msg_name;
-  nx_msg.msg_namelen = bmsg->msg_namelen;
+  struct sockaddr_storage nx_addr;
+  if (bmsg->msg_name && bmsg->msg_namelen > 0) {
+    nx_msg.msg_name = &nx_addr;
+    nx_msg.msg_namelen = sizeof(nx_addr);
+  }
   nx_msg.msg_iov = (struct iovec *)bmsg->msg_iov;
   nx_msg.msg_iovlen = (int)bmsg->msg_iovlen;
   nx_msg.msg_control = bmsg->msg_control;
@@ -437,7 +513,11 @@ ssize_t recvmsg_fake(int sockfd, struct bionic_msghdr *bmsg, int flags) {
   int nx_flags = translate_msg_flags_to_nx(flags);
   ssize_t ret = recvmsg(sockfd, &nx_msg, nx_flags);
   if (ret >= 0) {
-    bmsg->msg_namelen = nx_msg.msg_namelen;
+    if (bmsg->msg_name && nx_msg.msg_namelen > 0) {
+      socklen_t out_len = nx_msg.msg_namelen;
+      sockaddr_nx_to_bionic((struct sockaddr *)&nx_addr, (struct sockaddr *)bmsg->msg_name, &out_len);
+      bmsg->msg_namelen = out_len;
+    }
     bmsg->msg_controllen = nx_msg.msg_controllen;
     bmsg->msg_flags = translate_msg_flags_to_bionic(nx_msg.msg_flags);
   }

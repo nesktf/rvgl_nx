@@ -23,14 +23,85 @@
 static AppletHookCookie s_appletHookCookie;
 
 extern bool s_inSwkbd;
+extern bool s_textInputActive;
+
+typedef enum {
+  TEXT_FIELD_NONE = 0,
+  TEXT_FIELD_HOST,
+  TEXT_FIELD_NAME,
+} TextFieldType;
+
+static TextFieldType s_currentTextField = TEXT_FIELD_NONE;
+static u64 s_lastTextFieldTick = 0;
+static void (*orig_DrawHostComputer)(int, int) = NULL;
+static void (*orig_DrawEnterName)(int, int) = NULL;
+
+void touch_text_field(void) {
+  s_lastTextFieldTick = armGetSystemTick();
+}
+
+bool is_text_field_active(void) {
+  if (s_lastTextFieldTick == 0) {
+    s_currentTextField = TEXT_FIELD_NONE;
+    return false;
+  }
+  u64 diff = armGetSystemTick() - s_lastTextFieldTick;
+  if (diff >= (armGetSystemTickFreq() / 10)) {
+    s_currentTextField = TEXT_FIELD_NONE;
+    return false;
+  }
+  return true;
+}
+
+static void DrawHostComputer_hook(int a1, int a2) {
+  s_currentTextField = TEXT_FIELD_HOST;
+  touch_text_field();
+  if (orig_DrawHostComputer) {
+    orig_DrawHostComputer(a1, a2);
+  }
+}
+
+static void DrawEnterName_hook(int a1, int a2) {
+  s_currentTextField = TEXT_FIELD_NAME;
+  touch_text_field();
+  if (orig_DrawEnterName) {
+    orig_DrawEnterName(a1, a2);
+  }
+}
+
+void apply_text_input(const char *text) {
+  if (!text || text[0] == '\0') return;
+
+  if (s_currentTextField == TEXT_FIELD_HOST) {
+    uintptr_t settings_addr = so_find_addr_rx(&so_main, "settings");
+    if (settings_addr) {
+      char *host_ip = (char *)(settings_addr + 0x39c);
+      strncpy(host_ip, text, 31);
+      host_ip[31] = '\0';
+      debugPrintf("apply_text_input: directly set host IP to '%s'\n", host_ip);
+    }
+  } else if (s_currentTextField == TEXT_FIELD_NAME) {
+    uintptr_t ts_addr = so_find_addr_rx(&so_main, "titlescreen_data");
+    if (ts_addr) {
+      int *name_len = (int *)(ts_addr + 36);
+      char *name_buf = (char *)(ts_addr + 40);
+      int len = strlen(text);
+      if (len > 15) len = 15;
+      memcpy(name_buf, text, len);
+      name_buf[len] = '\0';
+      *name_len = len;
+      debugPrintf("apply_text_input: directly set profile name to '%s' (len=%d)\n", name_buf, len);
+    }
+  }
+}
 
 static void onAppletHook(AppletHookType type, void *param) {
-  if (s_inSwkbd) return;
+  if (s_inSwkbd || (s_textInputActive && is_text_field_active())) return;
 
   if (type == AppletHookType_OnFocusState) {
     AppletFocusState state = appletGetFocusState();
     debugPrintf("[AppletHook] OnFocusState: %d\n", state);
-    if (state != AppletFocusState_InFocus) {
+    if (state == AppletFocusState_Background) {
       debugPrintf("[AppletHook] Lost focus / console sleep -> sending FOCUS_LOST\n");
       SDL_Event ev;
       memset(&ev, 0, sizeof(ev));
@@ -38,7 +109,7 @@ static void onAppletHook(AppletHookType type, void *param) {
       ev.window.type = SDL_WINDOWEVENT;
       ev.window.event = SDL_WINDOWEVENT_FOCUS_LOST;
       SDL_PushEvent(&ev);
-    } else {
+    } else if (state == AppletFocusState_InFocus) {
       debugPrintf("[AppletHook] Regained focus -> sending FOCUS_GAINED\n");
       SDL_Event ev;
       memset(&ev, 0, sizeof(ev));
@@ -152,4 +223,60 @@ void patch_game(void) {
       debugPrintf("Warning: HandleWindowEventsv + 0x534 is 0x%08x (expected 0x3900d01f)\n", *unpause_instr);
     }
   }
+
+  // Hook DrawHostComputer and DrawEnterName draw callbacks in .data
+  uintptr_t expected_host = so_try_find_addr_rx(&so_main, "_Z16DrawHostComputerii");
+  uintptr_t expected_enter = so_try_find_addr_rx(&so_main, "_Z13DrawEnterNameii");
+
+  uintptr_t *draw_host_ptr = (uintptr_t *)((uintptr_t)so_main.load_base + 0x2f4138);
+  uintptr_t *draw_enter_ptr = (uintptr_t *)((uintptr_t)so_main.load_base + 0x2f6038);
+
+  if (*draw_host_ptr != expected_host) {
+    for (int off = -0x100; off <= 0x100; off += 8) {
+      uintptr_t *p = (uintptr_t *)((uintptr_t)so_main.load_base + 0x2f4138 + off);
+      if (*p == expected_host) {
+        draw_host_ptr = p;
+        break;
+      }
+    }
+  }
+
+  if (*draw_enter_ptr != expected_enter) {
+    for (int off = -0x100; off <= 0x100; off += 8) {
+      uintptr_t *p = (uintptr_t *)((uintptr_t)so_main.load_base + 0x2f6038 + off);
+      if (*p == expected_enter) {
+        draw_enter_ptr = p;
+        break;
+      }
+    }
+  }
+
+  if (*draw_host_ptr == expected_host) {
+    orig_DrawHostComputer = (void (*)(int, int))*draw_host_ptr;
+    *draw_host_ptr = (uintptr_t)&DrawHostComputer_hook;
+    debugPrintf("Hooked DrawHostComputer in .data at %p (orig=%p, hook=%p)\n",
+                draw_host_ptr, orig_DrawHostComputer, DrawHostComputer_hook);
+  } else {
+    debugPrintf("WARNING: could not locate DrawHostComputer in .data (expected %p, found %p)\n",
+                (void *)expected_host, (void *)*draw_host_ptr);
+  }
+
+  if (*draw_enter_ptr == expected_enter) {
+    orig_DrawEnterName = (void (*)(int, int))*draw_enter_ptr;
+    *draw_enter_ptr = (uintptr_t)&DrawEnterName_hook;
+    debugPrintf("Hooked DrawEnterName in .data at %p (orig=%p, hook=%p)\n",
+                draw_enter_ptr, orig_DrawEnterName, DrawEnterName_hook);
+  } else {
+    debugPrintf("WARNING: could not locate DrawEnterName in .data (expected %p, found %p)\n",
+                (void *)expected_enter, (void *)*draw_enter_ptr);
+  }
 }
+
+void unpatch_game(void) {
+  static bool unpatched = false;
+  if (unpatched) return;
+  unpatched = true;
+  appletUnhook(&s_appletHookCookie);
+  debugPrintf("unpatch_game: unhooked applet hook\n");
+}
+
