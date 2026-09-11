@@ -309,110 +309,147 @@ static FILE *freopen_hook(const char *path, const char *mode, FILE *stream) {
   return freopen(path, mode, stream);
 }
 
-static PadState s_switchPad;
-static bool s_switchPadInited = false;
-static uint64_t s_prevKeys = 0;
+#define INPUT_QUEUE_SIZE 256
+static char s_inputQueue[INPUT_QUEUE_SIZE];
+static int s_inputHead = 0;
+static int s_inputTail = 0;
+static bool s_textInputActive = false;
+static bool s_charSentThisFrame = false;
+bool s_inSwkbd = false;
 
-typedef struct {
-  uint64_t mask;
-  SDL_Scancode scancode;
-  SDL_Keycode keycode;
-} SwitchKeyMap;
-
-static const SwitchKeyMap s_keymap[] = {
-  { HidNpadButton_AnyUp,                             SDL_SCANCODE_UP,     SDLK_UP },
-  { HidNpadButton_AnyDown,                           SDL_SCANCODE_DOWN,   SDLK_DOWN },
-  { HidNpadButton_AnyLeft,                           SDL_SCANCODE_LEFT,   SDLK_LEFT },
-  { HidNpadButton_AnyRight,                          SDL_SCANCODE_RIGHT,  SDLK_RIGHT },
-  { HidNpadButton_A,                                 SDL_SCANCODE_RETURN, SDLK_RETURN },
-  { HidNpadButton_B,                                 SDL_SCANCODE_ESCAPE, SDLK_ESCAPE },
-  { HidNpadButton_X,                                 SDL_SCANCODE_SPACE,  SDLK_SPACE },
-  { HidNpadButton_Y,                                 SDL_SCANCODE_R,      SDLK_r },
-  { HidNpadButton_Plus,                              SDL_SCANCODE_ESCAPE, SDLK_ESCAPE },
-  { HidNpadButton_Minus,                             SDL_SCANCODE_TAB,    SDLK_TAB },
-  { HidNpadButton_ZL | HidNpadButton_L,              SDL_SCANCODE_DOWN,   SDLK_DOWN },
-  { HidNpadButton_ZR | HidNpadButton_R,              SDL_SCANCODE_UP,     SDLK_UP },
-};
-#define NUM_KEYMAPS (sizeof(s_keymap) / sizeof(s_keymap[0]))
-
-#define MAX_SYNTH_EVENTS 32
-static SDL_Event s_synthQueue[MAX_SYNTH_EVENTS];
-static int s_synthHead = 0;
-static int s_synthTail = 0;
-
-static void queue_key_event(Uint32 type, SDL_Scancode scancode, SDL_Keycode sym) {
-  int next = (s_synthTail + 1) % MAX_SYNTH_EVENTS;
-  if (next == s_synthHead) return;
-  SDL_Event *ev = &s_synthQueue[s_synthTail];
-  memset(ev, 0, sizeof(*ev));
-  ev->type = type;
-  ev->key.type = type;
-  ev->key.state = (type == SDL_KEYDOWN) ? SDL_PRESSED : SDL_RELEASED;
-  ev->key.repeat = 0;
-  ev->key.keysym.scancode = scancode;
-  ev->key.keysym.sym = sym;
-  s_synthTail = next;
+static void queue_input_char(char c) {
+  int next = (s_inputTail + 1) % INPUT_QUEUE_SIZE;
+  if (next != s_inputHead) {
+    s_inputQueue[s_inputTail] = c;
+    s_inputTail = next;
+  }
 }
 
-static uint64_t get_switch_pad_buttons(void) {
-  if (!s_switchPadInited) {
-    padInitializeAny(&s_switchPad);
-    s_switchPadInited = true;
+static void queue_input_string(const char *str) {
+  // First, send 16 backspaces to delete any existing/default text in the input box
+  for (int i = 0; i < 16; i++) {
+    queue_input_char('\b');
   }
-  padUpdate(&s_switchPad);
-  uint64_t curKeys = padGetButtons(&s_switchPad);
-  HidAnalogStickState l_stick = padGetStickPos(&s_switchPad, 0);
-  if (l_stick.x < -16000) curKeys |= HidNpadButton_StickLLeft;
-  if (l_stick.x > 16000)  curKeys |= HidNpadButton_StickLRight;
-  if (l_stick.y < -16000) curKeys |= HidNpadButton_StickLDown;
-  if (l_stick.y > 16000)  curKeys |= HidNpadButton_StickLUp;
-  return curKeys;
+  // Then queue each character of the string
+  while (*str) {
+    queue_input_char(*str++);
+  }
 }
 
-static Uint8 s_customKeyState[SDL_NUM_SCANCODES];
+static void trigger_swkbd(void) {
+  if (s_inSwkbd) return;
+  s_inSwkbd = true;
+  debugPrintf("trigger_swkbd launching...\n");
 
-static const Uint8 *SDL_GetKeyboardState_hook(int *numkeys) {
-  if (numkeys) *numkeys = SDL_NUM_SCANCODES;
-
-  const Uint8 *real = SDL_GetKeyboardState(NULL);
-  if (real) {
-    memcpy(s_customKeyState, real, SDL_NUM_SCANCODES);
-  } else {
-    memset(s_customKeyState, 0, SDL_NUM_SCANCODES);
-  }
-
-  uint64_t curKeys = get_switch_pad_buttons();
-
-  for (size_t i = 0; i < NUM_KEYMAPS; i++) {
-    if (curKeys & s_keymap[i].mask) {
-      s_customKeyState[s_keymap[i].scancode] = 1;
+  SwkbdConfig kbd;
+  Result rc = swkbdCreate(&kbd, 0);
+  if (R_SUCCEEDED(rc)) {
+    swkbdConfigMakePresetDefault(&kbd);
+    char out_text[256] = {0};
+    rc = swkbdShow(&kbd, out_text, sizeof(out_text));
+    swkbdClose(&kbd);
+    if (R_SUCCEEDED(rc) && out_text[0] != '\0') {
+      debugPrintf("swkbd returned: '%s'\n", out_text);
+      queue_input_string(out_text);
     }
   }
 
-  return s_customKeyState;
+  // Flush all input events that arrived while the swkbd overlay was showing
+  SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+  s_inSwkbd = false;
+}
+
+static void SDL_StartTextInput_hook(void) {
+  debugPrintf("SDL_StartTextInput_hook called\n");
+  s_textInputActive = true;
+  // Do NOT open swkbd automatically; wait for user to press (X) or tap the screen
+}
+
+static void SDL_StopTextInput_hook(void) {
+  debugPrintf("SDL_StopTextInput_hook called\n");
+  s_textInputActive = false;
+  s_inputHead = 0;
+  s_inputTail = 0;
+  SDL_StopTextInput();
 }
 
 static int SDL_PollEvent_hook(SDL_Event *event) {
-  uint64_t curKeys = get_switch_pad_buttons();
+  // If we have characters queued, feed ONE character per frame
+  if (!s_charSentThisFrame && s_inputHead != s_inputTail) {
+    char c = s_inputQueue[s_inputHead];
+    s_inputHead = (s_inputHead + 1) % INPUT_QUEUE_SIZE;
+    s_charSentThisFrame = true;
 
-  for (size_t i = 0; i < NUM_KEYMAPS; i++) {
-    bool wasDown = (s_prevKeys & s_keymap[i].mask) != 0;
-    bool isDown  = (curKeys   & s_keymap[i].mask) != 0;
-    if (isDown && !wasDown) {
-      queue_key_event(SDL_KEYDOWN, s_keymap[i].scancode, s_keymap[i].keycode);
-    } else if (!isDown && wasDown) {
-      queue_key_event(SDL_KEYUP, s_keymap[i].scancode, s_keymap[i].keycode);
+    if (event) {
+      memset(event, 0, sizeof(*event));
+      event->type = SDL_TEXTINPUT;
+      event->text.type = SDL_TEXTINPUT;
+      event->text.text[0] = c;
+      event->text.text[1] = '\0';
     }
-  }
-  s_prevKeys = curKeys;
-
-  if (s_synthHead != s_synthTail) {
-    if (event) *event = s_synthQueue[s_synthHead];
-    s_synthHead = (s_synthHead + 1) % MAX_SYNTH_EVENTS;
     return 1;
   }
 
-  return SDL_PollEvent(event);
+  int ret = SDL_PollEvent(event);
+  if (ret) {
+    if (event) {
+      // If text input is active and user presses (X) or taps screen, open swkbd on demand:
+      if (s_textInputActive && !s_inSwkbd) {
+        bool open_kbd = false;
+        if (event->type == SDL_CONTROLLERBUTTONDOWN && event->cbutton.button == SDL_CONTROLLER_BUTTON_X)
+          open_kbd = true;
+        else if (event->type == SDL_JOYBUTTONDOWN && event->jbutton.button == 2)
+          open_kbd = true;
+        else if (event->type == SDL_FINGERDOWN || event->type == SDL_MOUSEBUTTONDOWN)
+          open_kbd = true;
+
+        if (open_kbd) {
+          trigger_swkbd();
+          memset(event, 0, sizeof(*event));
+          return SDL_PollEvent(event);
+        }
+      }
+
+      // If user presses Backspace on physical keyboard:
+      // Turn SDL_KEYDOWN with Backspace into SDL_TEXTINPUT with '\b'
+      // so repeat keystrokes and single presses reliably delete characters in RVGL!
+      if (event->type == SDL_KEYDOWN && event->key.keysym.scancode == SDL_SCANCODE_BACKSPACE) {
+        event->type = SDL_TEXTINPUT;
+        event->text.type = SDL_TEXTINPUT;
+        event->text.text[0] = '\b';
+        event->text.text[1] = '\0';
+      }
+      // If user presses Return on physical keyboard:
+      if (event->type == SDL_KEYDOWN &&
+          (event->key.keysym.scancode == SDL_SCANCODE_RETURN || event->key.keysym.scancode == SDL_SCANCODE_KP_ENTER)) {
+        event->type = SDL_TEXTINPUT;
+        event->text.type = SDL_TEXTINPUT;
+        event->text.text[0] = '\r';
+        event->text.text[1] = '\0';
+      }
+    }
+    return 1;
+  }
+
+  // Frame finished draining events
+  s_charSentThisFrame = false;
+  return 0;
+}
+
+static int *__errno_hook(void) {
+  int *real_err = __errno();
+  if (real_err) {
+    switch (*real_err) {
+      case 112: *real_err = 98;  break; // EADDRINUSE (Newlib 112 -> Linux 98)
+      case 116: *real_err = 110; break; // ETIMEDOUT (Newlib 116 -> Linux 110)
+      case 119: *real_err = 115; break; // EINPROGRESS (Newlib 119 -> Linux 115)
+      case 120: *real_err = 114; break; // EALREADY (Newlib 120 -> Linux 114)
+      case 127: *real_err = 106; break; // EISCONN (Newlib 127 -> Linux 106)
+      case 128: *real_err = 107; break; // ENOTCONN (Newlib 128 -> Linux 107)
+      default: break;
+    }
+  }
+  return real_err;
 }
 
 static int SDL_NumJoysticks_hook(void) {
@@ -486,10 +523,6 @@ static int sdl_thread_wrapper(void *param) {
   free(t);
 
   debugPrintf("[SDL Thread %p] started execution\n", (void *)pthread_self());
-  if (al_ctx) {
-    alcMakeContextCurrent(al_ctx);
-    alcSetThreadContext(al_ctx);
-  }
   int ret = fn(data);
   debugPrintf("[SDL Thread %p] returned cleanly with %d\n", (void *)pthread_self(), ret);
   return ret;
@@ -568,7 +601,7 @@ DynLibFunction dynlib_functions[] = {
   { "SDL_GetDisplayMode", (uintptr_t)&SDL_GetDisplayMode },
   { "SDL_GetError", (uintptr_t)&SDL_GetError },
   { "SDL_GetKeyFromScancode", (uintptr_t)&SDL_GetKeyFromScancode },
-  { "SDL_GetKeyboardState", (uintptr_t)&SDL_GetKeyboardState_hook },
+  { "SDL_GetKeyboardState", (uintptr_t)&SDL_GetKeyboardState },
   { "SDL_GetModState", (uintptr_t)&SDL_GetModState },
   { "SDL_GetNumDisplayModes", (uintptr_t)&SDL_GetNumDisplayModes },
   { "SDL_GetPerformanceCounter", (uintptr_t)&SDL_GetPerformanceCounter },
@@ -625,8 +658,8 @@ DynLibFunction dynlib_functions[] = {
   { "SDL_SetWindowIcon", (uintptr_t)&SDL_SetWindowIcon },
   { "SDL_ShowMessageBox", (uintptr_t)&SDL_ShowMessageBox },
   { "SDL_ShowSimpleMessageBox", (uintptr_t)&SDL_ShowSimpleMessageBox },
-  { "SDL_StartTextInput", (uintptr_t)&SDL_StartTextInput },
-  { "SDL_StopTextInput", (uintptr_t)&SDL_StopTextInput },
+  { "SDL_StartTextInput", (uintptr_t)&SDL_StartTextInput_hook },
+  { "SDL_StopTextInput", (uintptr_t)&SDL_StopTextInput_hook },
   { "SDL_ThreadID", (uintptr_t)&SDL_ThreadID },
   { "SDL_TryLockMutex", (uintptr_t)&SDL_TryLockMutex },
   { "SDL_UnlockMutex", (uintptr_t)&SDL_UnlockMutex },
@@ -636,7 +669,7 @@ DynLibFunction dynlib_functions[] = {
   { "__ctype_get_mb_cur_max", (uintptr_t)&__ctype_get_mb_cur_max_fake },
   { "__cxa_atexit", (uintptr_t)&__cxa_atexit },
   { "__cxa_finalize", (uintptr_t)&ret0 },
-  { "__errno", (uintptr_t)&__errno },
+  { "__errno", (uintptr_t)&__errno_hook },
   { "__google_potentially_blocking_region_begin", (uintptr_t)&ret0 },
   { "__google_potentially_blocking_region_end", (uintptr_t)&ret0 },
   { "__isnanf", (uintptr_t)&__isnanf_fake },
@@ -734,7 +767,7 @@ DynLibFunction dynlib_functions[] = {
   { "getenv", (uintptr_t)&getenv },
   { "getnameinfo", (uintptr_t)&getnameinfo },
   { "getsockname", (uintptr_t)&getsockname },
-  { "getsockopt", (uintptr_t)&getsockopt },
+  { "getsockopt", (uintptr_t)&getsockopt_fake },
   { "gettimeofday", (uintptr_t)&gettimeofday },
   { "getwc", (uintptr_t)&getwc },
   { "gmtime_r", (uintptr_t)&gmtime_r },
@@ -802,13 +835,13 @@ DynLibFunction dynlib_functions[] = {
   { "read", (uintptr_t)&read },
   { "readdir", (uintptr_t)&readdir_fake },
   { "realloc", (uintptr_t)&realloc },
-  { "recvmsg", (uintptr_t)&recvmsg },
+  { "recvmsg", (uintptr_t)&recvmsg_fake },
   { "remove", (uintptr_t)&remove },
   { "rename", (uintptr_t)&rename },
   { "rewind", (uintptr_t)&rewind },
   { "rmdir", (uintptr_t)&rmdir },
   { "select", (uintptr_t)&select },
-  { "sendmsg", (uintptr_t)&sendmsg },
+  { "sendmsg", (uintptr_t)&sendmsg_fake },
   { "setlocale", (uintptr_t)&setlocale },
   { "setsockopt", (uintptr_t)&setsockopt_fake },
   { "setvbuf", (uintptr_t)&setvbuf },

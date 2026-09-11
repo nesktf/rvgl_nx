@@ -153,6 +153,11 @@ int fcntl_fake(int fd, int cmd, ...);
 
 // setsockopt with bionic->libnx level/optname constant translation
 int setsockopt_fake(int fd, int level, int optname, const void *optval, uint32_t optlen);
+int getsockopt_fake(int fd, int level, int optname, void *optval, socklen_t *optlen);
+
+struct bionic_msghdr;
+ssize_t sendmsg_fake(int sockfd, const struct bionic_msghdr *msg, int flags);
+ssize_t recvmsg_fake(int sockfd, struct bionic_msghdr *msg, int flags);
 
 // fake stdout FILE living in the fake __sF[] array (std::cout-style writes)
 extern void *fake_stdout;

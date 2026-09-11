@@ -25,16 +25,14 @@ static void initNxLink(void) {
   if (R_FAILED(socketInitializeDefault()))
     return;
   s_nxlinkSock = nxlinkStdio();
-  if (s_nxlinkSock < 0)
-    socketExit();
 }
 
 static void deinitNxLink(void) {
   if (s_nxlinkSock >= 0) {
     close(s_nxlinkSock);
-    socketExit();
     s_nxlinkSock = -1;
   }
+  socketExit();
 }
 
 static FILE *s_logFile = NULL;

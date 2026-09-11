@@ -285,20 +285,33 @@ int unlinkat_fake(int dirfd, const char *path, int flags) {
   return unlink(path);
 }
 
-// fcntl with bionic->newlib flag translation for the netcode's F_SETFL.
+// fcntl with bionic<->newlib flag translation for the netcode's F_GETFL/F_SETFL.
 // command numbers (F_DUPFD=0..F_SETFL=4) match between bionic and newlib.
 int fcntl_fake(int fd, int cmd, ...) {
   va_list va;
   va_start(va, cmd);
+  if (cmd == F_GETFL) {
+    va_end(va);
+    int ret = fcntl(fd, F_GETFL);
+    if (ret < 0) return ret;
+    int out = 0;
+    if (ret & O_NONBLOCK) out |= LINUX_O_NONBLOCK;
+    if (ret & O_APPEND)   out |= LINUX_O_APPEND;
+    if (ret & O_RDWR)     out |= 2;
+    if (ret & O_WRONLY)   out |= 1;
+    return out;
+  }
   if (cmd == F_SETFL) {
     const int flags = va_arg(va, int);
     va_end(va);
     int out = 0;
     if (flags & LINUX_O_NONBLOCK) out |= O_NONBLOCK;
     if (flags & LINUX_O_APPEND)   out |= O_APPEND;
+    if (flags & 2)                out |= O_RDWR;
+    if (flags & 1)                out |= O_WRONLY;
     return fcntl(fd, F_SETFL, out);
   }
-  // F_GETFL / F_GETFD / F_SETFD / F_DUPFD: forward the (optional) int arg
+  // F_GETFD / F_SETFD / F_DUPFD: forward the (optional) int arg
   const int arg = va_arg(va, int);
   va_end(va);
   return fcntl(fd, cmd, arg);
@@ -314,7 +327,10 @@ int setsockopt_fake(int fd, int level, int optname, const void *optval, uint32_t
     lv = SOL_SOCKET;
     switch (optname) {
       case 2:      on = SO_REUSEADDR; break;
+      case 4:      on = SO_ERROR;     break;
       case 6:      on = SO_BROADCAST; break;
+      case 7:      on = SO_SNDBUF;    break;
+      case 8:      on = SO_RCVBUF;    break;
       case 9:      on = SO_KEEPALIVE; break;
       case 15:     on = SO_REUSEPORT; break;
       case 20:     on = SO_RCVTIMEO;  break;
@@ -324,6 +340,108 @@ int setsockopt_fake(int fd, int level, int optname, const void *optval, uint32_t
     }
   }
   return setsockopt(fd, lv, on, optval, (socklen_t)optlen);
+}
+
+int getsockopt_fake(int fd, int level, int optname, void *optval, socklen_t *optlen) {
+  int lv = level;
+  int on = optname;
+  if (level == BIONIC_SOL_SOCKET) {
+    lv = SOL_SOCKET;
+    switch (optname) {
+      case 2:      on = SO_REUSEADDR; break;
+      case 4:      on = SO_ERROR;     break;
+      case 6:      on = SO_BROADCAST; break;
+      case 7:      on = SO_SNDBUF;    break;
+      case 8:      on = SO_RCVBUF;    break;
+      case 9:      on = SO_KEEPALIVE; break;
+      case 15:     on = SO_REUSEPORT; break;
+      case 20:     on = SO_RCVTIMEO;  break;
+      case 21:     on = SO_SNDTIMEO;  break;
+      default:     break;
+    }
+  }
+  int ret = getsockopt(fd, lv, on, optval, optlen);
+  if (ret == 0 && level == BIONIC_SOL_SOCKET && optname == 4 && optval && optlen && *optlen >= sizeof(int)) {
+    int *err = (int *)optval;
+    if (*err == 119) *err = 115;       // EINPROGRESS
+    else if (*err == 116) *err = 110;  // ETIMEDOUT
+    else if (*err == 112) *err = 98;   // EADDRINUSE
+    else if (*err == 127) *err = 106;  // EISCONN
+    else if (*err == 128) *err = 107;  // ENOTCONN
+  }
+  return ret;
+}
+
+struct bionic_msghdr {
+  void *msg_name;
+  socklen_t msg_namelen;
+  int __pad1;
+  void *msg_iov;
+  size_t msg_iovlen;
+  void *msg_control;
+  size_t msg_controllen;
+  int msg_flags;
+  int __pad2;
+};
+
+static int translate_msg_flags_to_nx(int flags) {
+  int out = 0;
+  if (flags & 0x01)   out |= MSG_OOB;
+  if (flags & 0x02)   out |= MSG_PEEK;
+  if (flags & 0x04)   out |= MSG_DONTROUTE;
+  if (flags & 0x40)   out |= MSG_WAITALL;
+  if (flags & 0x80)   out |= MSG_DONTWAIT;
+  if (flags & 0x4000) out |= MSG_NOSIGNAL; // Linux MSG_NOSIGNAL (0x4000) -> libnx MSG_NOSIGNAL (0x20000)
+  return out;
+}
+
+static int translate_msg_flags_to_bionic(int flags) {
+  int out = 0;
+  if (flags & MSG_OOB)     out |= 0x01;
+  if (flags & MSG_EOR)     out |= 0x08;
+  if (flags & MSG_TRUNC)   out |= 0x20; // Linux MSG_TRUNC = 0x20
+  if (flags & MSG_CTRUNC)  out |= 0x08;
+  return out;
+}
+
+ssize_t sendmsg_fake(int sockfd, const struct bionic_msghdr *bmsg, int flags) {
+  if (!bmsg) return sendmsg(sockfd, NULL, flags);
+
+  struct msghdr nx_msg;
+  memset(&nx_msg, 0, sizeof(nx_msg));
+  nx_msg.msg_name = bmsg->msg_name;
+  nx_msg.msg_namelen = bmsg->msg_namelen;
+  nx_msg.msg_iov = (struct iovec *)bmsg->msg_iov;
+  nx_msg.msg_iovlen = (int)bmsg->msg_iovlen;
+  nx_msg.msg_control = bmsg->msg_control;
+  nx_msg.msg_controllen = (socklen_t)bmsg->msg_controllen;
+  nx_msg.msg_flags = translate_msg_flags_to_nx(bmsg->msg_flags);
+
+  int nx_flags = translate_msg_flags_to_nx(flags);
+  return sendmsg(sockfd, &nx_msg, nx_flags);
+}
+
+ssize_t recvmsg_fake(int sockfd, struct bionic_msghdr *bmsg, int flags) {
+  if (!bmsg) return recvmsg(sockfd, NULL, flags);
+
+  struct msghdr nx_msg;
+  memset(&nx_msg, 0, sizeof(nx_msg));
+  nx_msg.msg_name = bmsg->msg_name;
+  nx_msg.msg_namelen = bmsg->msg_namelen;
+  nx_msg.msg_iov = (struct iovec *)bmsg->msg_iov;
+  nx_msg.msg_iovlen = (int)bmsg->msg_iovlen;
+  nx_msg.msg_control = bmsg->msg_control;
+  nx_msg.msg_controllen = (socklen_t)bmsg->msg_controllen;
+  nx_msg.msg_flags = translate_msg_flags_to_nx(bmsg->msg_flags);
+
+  int nx_flags = translate_msg_flags_to_nx(flags);
+  ssize_t ret = recvmsg(sockfd, &nx_msg, nx_flags);
+  if (ret >= 0) {
+    bmsg->msg_namelen = nx_msg.msg_namelen;
+    bmsg->msg_controllen = nx_msg.msg_controllen;
+    bmsg->msg_flags = translate_msg_flags_to_bionic(nx_msg.msg_flags);
+  }
+  return ret;
 }
 
 // ---------------------------------------------------------------------------
@@ -794,7 +912,7 @@ static int index_lookup_cmp(const void *key, const void *elem) {
 }
 
 // returns 0 only when the path is inside an indexed tree and known absent
-static int index_maybe_exists(const char *path) {
+__attribute__((unused)) static int index_maybe_exists(const char *path) {
   if (!asset_index_ready) {
     index_scan_dir("data");
     index_scan_dir("es2");

@@ -182,7 +182,7 @@ int main(int argc, char *argv[]) {
     write_rvgl_ini("/switch/rvgl/rvgl.ini");
   }
 
-  // Ensure profiles/t/profile.ini has audio settings
+  // Ensure profiles/t/profile.ini has audio and joystick settings
   struct stat st_prof;
   if (stat("/switch/rvgl/profiles/t/profile.ini", &st_prof) < 0) {
     FILE *fp = fopen("/switch/rvgl/profiles/t/profile.ini", "w");
@@ -194,7 +194,21 @@ int main(int argc, char *argv[]) {
         "SfxVol = 100\n"
         "SfxChannels = 16\n"
         "SampleRate = 48000\n"
+        "\n"
+        "[Joystick]\n"
+        "Controller1 = 0\n"
       );
+      fclose(fp);
+    }
+  } else {
+    FILE *fp = fopen("/switch/rvgl/profiles/t/profile.ini", "r+");
+    if (fp) {
+      char content[4096] = {0};
+      size_t read_bytes = fread(content, 1, sizeof(content) - 1, fp);
+      if (read_bytes > 0 && strstr(content, "Controller1") == NULL) {
+        fseek(fp, 0, SEEK_END);
+        fprintf(fp, "\n[Joystick]\nController1 = 0\n");
+      }
       fclose(fp);
     }
   }
