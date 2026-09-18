@@ -117,3 +117,26 @@ Because the Android `.so` expects a Linux/Bionic runtime environment, an extensi
 | `source/hooks/opengl.c` | **Modified** | OpenGL hooks and viewport setup. |
 | `source/util.c` | **Modified** | nxlink network logging and app exit handler. |
 | `Makefile` | **Modified** | Build configuration, includes, compiler flags, and link dependencies. |
+
+---
+
+## 7. Multiplayer Stability & Clean Exit Teardown
+
+### Issue 1: Socket Initialization Regression
+- **Root Cause**: `initNxLink()` and socket initialization routines in `source/util.c` were previously wrapped under `#ifdef DEBUG_LOG`. When `DEBUG_LOG` was commented out in `config.h`, `socketInitialize()` was never called on startup, causing LAN multiplayer hosting and joining to do nothing.
+- **Fix**:
+  - Decoupled network and socket initialization from debug logging by introducing `init_network()` and `deinit_network()` in `source/util.c` with a fallback to `socketInitializeDefault()`.
+  - Added safeguards against double-conversion in `sockaddr_bionic_to_nx` and `sockaddr_nx_to_bionic` in `source/libc_shim.c`.
+
+### Issue 2: Audio Double-Free on Normal Exit
+- **Root Cause**: RVGL's `ReleaseAudio()` teardown function cleans up its own OpenAL audio subsystem on exit, calling `alcDestroyContext` and `alcCloseDevice`. The wrapper's subsequent call to `deinit_openal()` in `main.c` attempted to destroy the already-freed context and close the closed device pointer, causing memory corruption.
+- **Fix**: Installed `alcDestroyContextHook` and `alcCloseDeviceHook` in `source/imports.c` to clear the stored `al_ctx` and `al_dev` pointers when RVGL destroys them, ensuring `deinit_openal()` is safe and idempotent.
+
+### Issue 3: Exit Crash (2001-0106 / InvalidCurrentMemory) After Multiplayer
+- **Root Cause**: When hosting or joining a multiplayer session, RVGL's `InitNetwork(bool)` spawned a detached background thread named `"IP Thread"` (`SDL_CreateThread`) that queried an external WAN IP service (`api.ipify.org` / `fetch_ip`) and looped in `SDL_Delay(10000)`. When exiting the game, this detached thread remained alive with its 2MB stack allocated on the heap. When `main()` exited to the Homebrew Loader (`hbl`), `hbl` called `svcSetHeapSize()` to reset the heap; Horizon OS rejected the call with `0xD401` (`ResultInvalidCurrentMemory`) due to active thread stack pages inside the heap, crashing `hbl`.
+- **Fix**:
+  - In `source/hooks/game.c`, pre-populated both `net_local_ip_string` and `net_public_ip_string` with the Switch's IP in `set_switch_local_ip()` and set `net_have_public_ip = 1`.
+  - Patched `InitNetworkb` at runtime to NOP out the branch initiating the `"IP Thread"` creation, along with the `SDL_CreateThread` and `SDL_DetachThread` calls.
+  - Added an interception guard in `SDL_CreateThread_hook` (`source/imports.c`) to block any `"IP Thread"` creation.
+  - In `source/main.c`, explicitly called `ReleaseNetwork()` on exit to disconnect active ENet peers and close open sockets before module unmapping and network deinitialization.
+

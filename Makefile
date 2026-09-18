@@ -39,7 +39,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	RVGL
-APP_VERSION := 1.0.0
+APP_VERSION := 1.0.1
 APP_AUTHOR := RV Team, nesktf
 BUILD		:=	build
 SOURCES		:=	source source/hooks

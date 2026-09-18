@@ -389,9 +389,12 @@ static void sockaddr_bionic_to_nx(const struct sockaddr *src, struct sockaddr_st
   if (len > sizeof(struct sockaddr_storage)) len = sizeof(struct sockaddr_storage);
   memcpy(dst, src, len);
   if (len >= 2) {
-    uint8_t family = ((const uint8_t *)src)[0];
-    ((uint8_t *)dst)[0] = (uint8_t)len;
-    ((uint8_t *)dst)[1] = family;
+    uint8_t b0 = ((const uint8_t *)src)[0];
+    uint8_t b1 = ((const uint8_t *)src)[1];
+    if (b1 == 0 && b0 != 0) {
+      ((uint8_t *)dst)[0] = (uint8_t)len;
+      ((uint8_t *)dst)[1] = b0;
+    }
   }
   *addrlen = len;
 }
@@ -402,9 +405,12 @@ static void sockaddr_nx_to_bionic(const struct sockaddr *src, struct sockaddr *d
   if (len > sizeof(struct sockaddr_storage)) len = sizeof(struct sockaddr_storage);
   memcpy(dst, src, len);
   if (len >= 2) {
-    uint8_t family = ((const uint8_t *)src)[1];
-    ((uint8_t *)dst)[0] = family;
-    ((uint8_t *)dst)[1] = 0;
+    uint8_t b0 = ((const uint8_t *)src)[0];
+    uint8_t b1 = ((const uint8_t *)src)[1];
+    if (b0 == len && b1 != 0) {
+      ((uint8_t *)dst)[0] = b1;
+      ((uint8_t *)dst)[1] = 0;
+    }
   }
 }
 

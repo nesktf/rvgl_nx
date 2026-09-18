@@ -12,14 +12,15 @@
 
 #include "util.h"
 
-#ifdef DEBUG_LOG
 #include <stdio.h>
 #include <string.h>
 #include "config.h"
 
+#ifdef DEBUG_LOG
 static int s_nxlinkSock = -1;
+#endif
 
-static void initNxLink(void) {
+static void init_network(void) {
   SocketInitConfig cfg = {
     .tcp_tx_buf_size = 0x8000,
     .tcp_rx_buf_size = 0x8000,
@@ -31,38 +32,54 @@ static void initNxLink(void) {
     .num_bsd_sessions = 3,
     .bsd_service_type = BsdServiceType_Auto,
   };
-  if (R_FAILED(socketInitialize(&cfg)))
-    return;
+  Result rc = socketInitialize(&cfg);
+  if (R_FAILED(rc)) {
+    rc = socketInitializeDefault();
+    if (R_FAILED(rc))
+      return;
+  }
+#ifdef DEBUG_LOG
   s_nxlinkSock = nxlinkStdio();
+#endif
 }
 
-static void deinitNxLink(void) {
+void deinit_network(void) {
+  static bool deinited = false;
+  if (deinited) return;
+  deinited = true;
+
+#ifdef DEBUG_LOG
   if (s_nxlinkSock >= 0) {
     close(s_nxlinkSock);
     s_nxlinkSock = -1;
   }
+#endif
   socketExit();
 }
 
+#ifdef DEBUG_LOG
 static FILE *s_logFile = NULL;
+#endif
 
 void userAppInit(void) {
-  initNxLink();
+  init_network();
+#ifdef DEBUG_LOG
   s_logFile = fopen(LOG_NAME, "w");
+#endif
 }
 
 void unpatch_game(void);
 
 void userAppExit(void) {
   unpatch_game();
+#ifdef DEBUG_LOG
   if (s_logFile) {
     fclose(s_logFile);
     s_logFile = NULL;
   }
-  deinitNxLink();
-}
-
 #endif
+  deinit_network();
+}
 
 int debugPrintf(char *text, ...) {
 #ifdef DEBUG_LOG

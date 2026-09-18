@@ -150,6 +150,22 @@ static ALCdevice *alcOpenDeviceHook(const char *name) {
   return al_dev;
 }
 
+static void alcDestroyContextHook(ALCcontext *context) {
+  debugPrintf("alcDestroyContextHook(%p)\n", context);
+  if (context == al_ctx) {
+    al_ctx = NULL;
+  }
+  alcDestroyContext(context);
+}
+
+static ALCboolean alcCloseDeviceHook(ALCdevice *device) {
+  debugPrintf("alcCloseDeviceHook(%p)\n", device);
+  if (device == al_dev) {
+    al_dev = NULL;
+  }
+  return alcCloseDevice(device);
+}
+
 static void *alcGetProcAddress_hook(ALCdevice *dev, const ALCchar *funcname) {
   void *res = alcGetProcAddress(dev, funcname);
   if (!res && funcname) {
@@ -495,6 +511,10 @@ static int sdl_thread_wrapper(void *param) {
 
 static SDL_Thread *SDL_CreateThread_hook(SDL_ThreadFunction fn, const char *name, void *data) {
   debugPrintf("SDL_CreateThread('%s', fn=%p, data=%p)\n", name ? name : "unnamed", fn, data);
+  if (name && (strcmp(name, "IP Thread") == 0 || strstr(name, "IP") != NULL)) {
+    debugPrintf("SDL_CreateThread_hook: blocked '%s' to avoid exit hang\n", name);
+    return NULL;
+  }
   SDLThreadWrapperArgs *t = malloc(sizeof(*t));
   t->fn = fn;
   t->data = data;
@@ -671,9 +691,9 @@ DynLibFunction dynlib_functions[] = {
   { "alSourceUnqueueBuffers", (uintptr_t)&alSourceUnqueueBuffers },
   { "alSourcef", (uintptr_t)&alSourcef },
   { "alSourcei", (uintptr_t)&alSourcei },
-  { "alcCloseDevice", (uintptr_t)&alcCloseDevice },
+  { "alcCloseDevice", (uintptr_t)&alcCloseDeviceHook },
   { "alcCreateContext", (uintptr_t)&alcCreateContextHook },
-  { "alcDestroyContext", (uintptr_t)&alcDestroyContext },
+  { "alcDestroyContext", (uintptr_t)&alcDestroyContextHook },
   { "alcGetContextsDevice", (uintptr_t)&alcGetContextsDevice },
   { "alcGetCurrentContext", (uintptr_t)&alcGetCurrentContext },
   { "alcGetError", (uintptr_t)&alcGetError },

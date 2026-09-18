@@ -61,8 +61,6 @@ void __libnx_initheap(void) {
 }
 
 
-#include <dirent.h>
-
 static void check_data(void) {
   struct stat st;
   if (stat(SO_NAME, &st) < 0) {
@@ -209,6 +207,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
+
   check_syscalls();
   check_data();
 
@@ -328,9 +327,16 @@ int main(int argc, char *argv[]) {
   int ret = SDL_main_func(game_argc, game_argv);
   printf("SDL_main returned %d\n", ret);
 
+  void (*ReleaseNetwork_func)(void) = (void *)so_try_find_addr_rx(&so_main, "_Z14ReleaseNetworkv");
+  if (ReleaseNetwork_func) {
+    debugPrintf("main: calling ReleaseNetwork before exit\n");
+    ReleaseNetwork_func();
+  }
+
   deinit_openal();
   deinit_opengl();
   unpatch_game();
+  deinit_network();
 
   printf("Unloading modules...\n");
   so_unload(&so_main);

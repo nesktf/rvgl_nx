@@ -123,6 +123,8 @@ static void onAppletHook(AppletHookType type, void *param) {
 
 static void set_switch_local_ip(void) {
   uintptr_t local_ip_addr = so_find_addr(&so_main, "net_local_ip_string");
+  uintptr_t public_ip_addr = so_find_addr(&so_main, "net_public_ip_string");
+  uintptr_t have_public_ip_addr = so_find_addr(&so_main, "net_have_public_ip");
   if (!local_ip_addr) return;
 
   u32 ip = 0;
@@ -142,7 +144,15 @@ static void set_switch_local_ip(void) {
   } else {
     strncpy((char *)local_ip_addr, "127.0.0.1", 256);
   }
-  debugPrintf("[Network] Local IP set to '%s' (addr=%p)\n", (char *)local_ip_addr, (void *)local_ip_addr);
+
+  if (public_ip_addr) {
+    strncpy((char *)public_ip_addr, (char *)local_ip_addr, 256);
+  }
+  if (have_public_ip_addr) {
+    *(uint8_t *)have_public_ip_addr = 1;
+  }
+  debugPrintf("[Network] Local IP set to '%s' (addr=%p), public IP pre-set\n",
+              (char *)local_ip_addr, (void *)local_ip_addr);
 }
 
 static void InitLocalIp_hook(void) {
@@ -201,12 +211,31 @@ void patch_game(void) {
   // Pre-set local IP in net_local_ip_string
   set_switch_local_ip();
 
-  // Hook internal local IP query at 0x158b5c
+  // Hook internal local IP query at 0x158b5c and disable background IP Thread spawn
   uintptr_t init_net = so_find_addr(&so_main, "_Z11InitNetworkb");
   if (init_net) {
     uintptr_t func_158b5c = init_net - 0x15e660 + 0x158b5c;
     hook_arm64(func_158b5c, (uintptr_t)InitLocalIp_hook);
     debugPrintf("Hooked InitLocalIp at %p\n", (void *)func_158b5c);
+
+    // Prevent spawning detached IP Thread (which loops in SDL_Delay(10000) and crashes hbl on exit):
+    // NOP out `cbz w0, 15e8d8` at init_net + 0x1b4
+    uint32_t *spawn_ip_branch = (uint32_t *)(init_net + 0x1b4);
+    if (*spawn_ip_branch == 0x34000620) {
+      *spawn_ip_branch = 0xd503201f; // nop
+      debugPrintf("Patched InitNetworkb + 0x1b4 (disabled IP Thread spawn branch)\n");
+    } else {
+      debugPrintf("Warning: InitNetworkb + 0x1b4 is 0x%08x (expected 0x34000620)\n", *spawn_ip_branch);
+    }
+
+    // Also NOP out the SDL_CreateThread call at init_net + 0x2a0 and SDL_DetachThread at +0x2a4
+    uint32_t *create_thread_instr = (uint32_t *)(init_net + 0x2a0);
+    uint32_t *detach_thread_instr = (uint32_t *)(init_net + 0x2a4);
+    if (*create_thread_instr == 0x97fbd7e8) {
+      *create_thread_instr = 0xd503201f; // nop
+      *detach_thread_instr = 0xd503201f; // nop
+      debugPrintf("Patched InitNetworkb + 0x2a0/0x2a4 (disabled SDL_CreateThread/SDL_DetachThread)\n");
+    }
   }
 
   // Prevent HandleWindowEventsv from auto-unpausing when FOCUS_GAINED arrives on console wake-up.

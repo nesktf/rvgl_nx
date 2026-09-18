@@ -13,6 +13,8 @@
 
 int debugPrintf(char *text, ...);
 
+void deinit_network(void);
+
 int ret0(void);
 int ret1(void);
 int retm1(void);
